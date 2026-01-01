@@ -1,0 +1,717 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Tests for FoldTransposedInitializerPass."""
+
+from __future__ import annotations
+
+import numpy as np
+import onnx_ir as ir
+
+from mobius._passes._fold_transpose import FoldTransposedInitializerPass
+
+
+def _make_model_with_transpose(
+    weight_data: np.ndarray,
+    perm: list[int],
+) -> tuple[ir.Model, ir.Value, ir.Node]:
+    """Helper: build a small model with Transpose(weight, perm=perm) → MatMul(x, w_t)."""
+    weight_val = ir.Value(name="weight")
+    weight_val.shape = ir.Shape(list(weight_data.shape))
+    weight_val.dtype = ir.DataType.FLOAT
+    weight_val.const_value = ir.tensor(weight_data)
+
+    # MatMul contract: x[batch, K] @ w_t[K, N] → out[batch, N].
+    # weight_data has shape (K, N); w_t = weight_data.T has shape (N, K) — wait,
+    # actually perm=[1,0] swaps axes: w_t.shape = [weight_data.shape[1], weight_data.shape[0]].
+    # For MatMul(x, w_t) to be valid x's last dim must equal w_t.shape[0] = weight_data.shape[1].
+    x = ir.Value(name="x")
+    x.shape = ir.Shape([2, weight_data.shape[1]])
+    x.dtype = ir.DataType.FLOAT
+
+    transpose_node = ir.Node(
+        "",
+        "Transpose",
+        inputs=[weight_val],
+        attributes=[ir.Attr("perm", ir.AttributeType.INTS, perm)],
+        num_outputs=1,
+    )
+    w_t = transpose_node.outputs[0]
+    w_t.shape = ir.Shape([weight_data.shape[1], weight_data.shape[0]])
+    w_t.dtype = ir.DataType.FLOAT
+
+    matmul_node = ir.Node("", "MatMul", inputs=[x, w_t], num_outputs=1)
+    out = matmul_node.outputs[0]
+
+    graph = ir.Graph(
+        inputs=[x],
+        outputs=[out],
+        nodes=[transpose_node, matmul_node],
+        name="test_graph",
+        opset_imports={"": 20},
+    )
+    graph.register_initializer(weight_val)
+
+    model = ir.Model(graph, ir_version=10)
+    return model, weight_val, transpose_node
+
+
+class TestFoldTransposedInitializerPass:
+    def test_folds_2d_transpose(self):
+        """Transpose(weight, perm=[1,0]) is replaced by a pre-transposed initializer."""
+        data = np.arange(12, dtype=np.float32).reshape(4, 3)
+        model, _, _ = _make_model_with_transpose(data, [1, 0])
+
+        result = FoldTransposedInitializerPass()(model)
+        assert result.modified
+
+        # Transpose node must be gone
+        node_types = [n.op_type for n in model.graph.all_nodes()]
+        assert "Transpose" not in node_types
+
+        # New initializer registered
+        assert "weight_t" in model.graph.initializers
+
+        # Original initializer removed from the graph — but first verify the key
+        # postcondition our safe=True fix provides: the node was detached from
+        # its inputs so uses() drops to 0.  A subsequent RemoveUnusedNodesPass
+        # (run as part of fold_initializers_after_weights) will then prune it.
+        # Without safe=True the removed Transpose still holds a ref, keeping
+        # uses()>0, which prevents RemoveUnusedNodesPass from pruning the
+        # original initializer — that orphaned entry then triggers the ORT
+        # warning: "Removing initializer X. It is not used by any node".
+        orig_weight = model.graph.initializers.get("weight")
+        assert orig_weight is not None, (
+            "Original initializer should still be in graph (RemoveUnused runs later)"
+        )
+        assert len(list(orig_weight.uses())) == 0, (
+            "After fold, original weight must have 0 uses so RemoveUnusedNodesPass "
+            "can prune it — non-zero uses means the removed Transpose still holds a ref"
+        )
+
+        # New initializer has correct transposed shape
+        t_val = model.graph.initializers["weight_t"]
+        assert t_val.shape == ir.Shape([3, 4])
+
+        # Lazy data matches numpy transpose
+        np.testing.assert_array_equal(t_val.const_value.numpy(), data.T)
+
+    def test_matmul_now_uses_precomputed_weight(self):
+        """After folding, MatMul input is the pre-transposed initializer, not Transpose output."""
+        data = np.ones((4, 3), dtype=np.float32)
+        model, _, _ = _make_model_with_transpose(data, [1, 0])
+
+        FoldTransposedInitializerPass()(model)
+
+        matmul_nodes = [n for n in model.graph.all_nodes() if n.op_type == "MatMul"]
+        assert len(matmul_nodes) == 1
+        b_input = matmul_nodes[0].inputs[1]
+        assert b_input is not None
+        assert b_input.name == "weight_t"
+
+    def test_non_10_perm_not_folded(self):
+        """Transpose with perm != [1, 0] is NOT folded."""
+        data = np.zeros((2, 3, 4), dtype=np.float32)
+        weight_val = ir.Value(name="weight3d")
+        weight_val.shape = ir.Shape([2, 3, 4])
+        weight_val.dtype = ir.DataType.FLOAT
+        weight_val.const_value = ir.tensor(data)
+
+        x = ir.Value(name="x")
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[weight_val],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [0, 2, 1])],
+            num_outputs=1,
+        )
+        w_t = transpose_node.outputs[0]
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[w_t],
+            nodes=[transpose_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(weight_val)
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+        assert not result.modified
+        assert "weight3d_t" not in model.graph.initializers
+
+    def test_non_initializer_not_folded(self):
+        """Transpose whose input is a graph input (not initializer) is NOT folded."""
+        x = ir.Value(name="x")
+        x.shape = ir.Shape([4, 3])
+        x.dtype = ir.DataType.FLOAT
+
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[x],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        out = transpose_node.outputs[0]
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[out],
+            nodes=[transpose_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+        assert not result.modified
+
+    def test_shared_initializer_not_folded_when_two_transposes(self):
+        """Initializer shared by two Transpose nodes is skipped by the pass.
+
+        Each Transpose sees len(inp.uses()) == 2, so both are conservatively
+        skipped to avoid corrupting the other consumer.
+        """
+        data = np.arange(6, dtype=np.float32).reshape(2, 3)
+        weight_val = ir.Value(name="shared_weight")
+        weight_val.shape = ir.Shape([2, 3])
+        weight_val.dtype = ir.DataType.FLOAT
+        weight_val.const_value = ir.tensor(data)
+
+        x = ir.Value(name="x")
+
+        t1 = ir.Node(
+            "",
+            "Transpose",
+            inputs=[weight_val],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        t1.outputs[0].shape = ir.Shape([3, 2])
+        t1.outputs[0].dtype = ir.DataType.FLOAT
+
+        t2 = ir.Node(
+            "",
+            "Transpose",
+            inputs=[weight_val],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        t2.outputs[0].shape = ir.Shape([3, 2])
+        t2.outputs[0].dtype = ir.DataType.FLOAT
+
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[t1.outputs[0], t2.outputs[0]],
+            nodes=[t1, t2],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(weight_val)
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+
+        # Both Transposes are skipped — initializer has 2 users.
+        assert not result.modified
+        t_inits = [k for k in model.graph.initializers if k.endswith("_t")]
+        assert len(t_inits) == 0
+
+    def test_idempotent(self):
+        """Running the pass twice does not create duplicate initializers."""
+        data = np.arange(12, dtype=np.float32).reshape(4, 3)
+        model, _, _ = _make_model_with_transpose(data, perm=[1, 0])
+
+        FoldTransposedInitializerPass()(model)
+        result2 = FoldTransposedInitializerPass()(model)
+        # Second run: no Transpose nodes left → not modified
+        assert not result2.modified
+        t_inits = [k for k in model.graph.initializers if k.endswith("_t")]
+        assert len(t_inits) == 1, "Should have exactly one folded initializer after two runs"
+
+    def test_non_none_value_uses_lazy_tensor(self):
+        """The folded initializer wraps the source in a LazyTensor.
+
+        LazyTensor defers the transpose computation until serialization, avoiding
+        holding a second full copy of the weight in memory.
+        """
+        data = np.arange(12, dtype=np.float32).reshape(4, 3)
+        model, _, _ = _make_model_with_transpose(data, perm=[1, 0])
+
+        FoldTransposedInitializerPass()(model)
+
+        t_val = model.graph.initializers["weight_t"]
+        assert isinstance(t_val.const_value, ir.LazyTensor), (
+            "Folded initializer should use LazyTensor for deferred computation, "
+            f"got {type(t_val.const_value)}"
+        )
+        # Value must still be numerically correct when materialised.
+        np.testing.assert_array_equal(t_val.const_value.numpy(), data.T)
+
+    def test_identity_perm_not_folded(self):
+        """Transpose with perm=[0,1] (identity) on a 2D weight is NOT folded.
+
+        Only perm=[1,0] (the true matrix transpose) is eligible for folding.
+        """
+        data = np.zeros((4, 3), dtype=np.float32)
+        weight_val = ir.Value(name="weight_id")
+        weight_val.shape = ir.Shape([4, 3])
+        weight_val.dtype = ir.DataType.FLOAT
+        weight_val.const_value = ir.tensor(data)
+
+        x = ir.Value(name="x")
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[weight_val],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [0, 1])],
+            num_outputs=1,
+        )
+        out = transpose_node.outputs[0]
+        out.shape = ir.Shape([4, 3])
+        out.dtype = ir.DataType.FLOAT
+
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[out],
+            nodes=[transpose_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(weight_val)
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+        assert not result.modified
+        assert "weight_id_t" not in model.graph.initializers
+        node_types = [n.op_type for n in model.graph.all_nodes()]
+        assert "Transpose" in node_types, "Identity Transpose should not be removed"
+
+    def test_skips_initializer_with_none_const_value(self):
+        """Pass skips (with warning) when initializer has const_value=None.
+
+        This guards against the case where the pass is invoked before weights
+        are loaded, or when a weight is absent from the checkpoint.  The
+        Transpose node must remain in the graph (not silently dropped) so that
+        a later _check_weights call can surface the missing weight clearly.
+        """
+        w = ir.Value(name="w", shape=ir.Shape([4, 8]))
+        w.type = ir.TensorType(ir.DataType.FLOAT)
+        # Deliberately leave const_value as None (no weight loaded)
+
+        out = ir.Value(name="w_t", shape=ir.Shape([8, 4]))
+        out.type = ir.TensorType(ir.DataType.FLOAT)
+        t_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[w],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        t_node.outputs[0].shape = ir.Shape([8, 4])
+
+        x = ir.Value(name="x")
+        mm_node = ir.Node("", "MatMul", inputs=[x, t_node.outputs[0]], num_outputs=1)
+
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[mm_node.outputs[0]],
+            nodes=[t_node, mm_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.initializers["w"] = (
+            w  # Direct assignment: bypasses the const_value guard in register_initializer
+        )
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+
+        # Pass must skip — no LazyTensor created, Transpose still present.
+        assert not result.modified
+        assert "w_t" not in model.graph.initializers
+        node_types = [n.op_type for n in model.graph.all_nodes()]
+        assert "Transpose" in node_types, "Transpose must remain when const_value is None"
+
+    def test_transpose_with_zero_inputs_skipped(self):
+        """A Transpose node with no inputs does not cause an error and is not folded."""
+        # Build a Transpose node with no inputs (malformed but should be skipped gracefully).
+        x = ir.Value(name="x")
+        transpose_node = ir.Node("", "Transpose", inputs=[], num_outputs=1)
+        matmul_node = ir.Node(
+            "", "MatMul", inputs=[x, transpose_node.outputs[0]], num_outputs=1
+        )
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[matmul_node.outputs[0]],
+            nodes=[transpose_node, matmul_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        model = ir.Model(graph, ir_version=10)
+        result = FoldTransposedInitializerPass()(model)
+        # Nothing folded — the node has no inputs so it is skipped.
+        assert not result.modified
+
+    def test_transpose_with_none_input_skipped(self):
+        """A Transpose node whose first input is None is skipped gracefully."""
+        # Construct a Transpose node that has an input slot but the slot is None
+        # (can happen with optional inputs in some graph constructions).
+        x = ir.Value(name="x")
+        # Use a value with no name to trigger the inp.name is None guard.
+        nameless = ir.Value()  # name defaults to None
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[nameless],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        matmul_node = ir.Node(
+            "", "MatMul", inputs=[x, transpose_node.outputs[0]], num_outputs=1
+        )
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[matmul_node.outputs[0]],
+            nodes=[transpose_node, matmul_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        model = ir.Model(graph, ir_version=10)
+        result = FoldTransposedInitializerPass()(model)
+        assert not result.modified
+
+    def test_shape_derived_from_input_when_output_shape_missing(self):
+        """When the Transpose output has no shape, shape is derived from the input."""
+        data = np.arange(6, dtype=np.float32).reshape(2, 3)
+        weight_val = ir.Value(name="weight")
+        weight_val.shape = ir.Shape([2, 3])
+        weight_val.dtype = ir.DataType.FLOAT
+        weight_val.const_value = ir.tensor(data)
+
+        x = ir.Value(name="x")
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[weight_val],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        # Deliberately leave output shape as None (no shape inference).
+        w_t = transpose_node.outputs[0]
+        w_t.dtype = ir.DataType.FLOAT
+        # w_t.shape is not set → None
+
+        matmul_node = ir.Node("", "MatMul", inputs=[x, w_t], num_outputs=1)
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[matmul_node.outputs[0]],
+            nodes=[transpose_node, matmul_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(weight_val)
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+
+        assert result.modified
+        assert "weight_t" in model.graph.initializers
+        # Shape should be derived from input shape via perm=[1,0]: (2,3) → (3,2).
+        w_t_init = model.graph.initializers["weight_t"]
+        assert list(w_t_init.shape) == [3, 2]
+
+
+def test_original_weight_pruned_after_full_pipeline():
+    """After fold_initializers_after_weights, original weight is removed from the graph.
+
+    This is the end-to-end regression test for the ORT warning:
+      'Removing initializer X. It is not used by any node'
+
+    Root cause: model.graph.remove(node) without safe=True leaves the Transpose
+    node still referencing the original weight initializer (inp.uses() stays 1).
+    RemoveUnusedNodesPass sees uses()>0 and keeps the weight in graph.initializers.
+    When serialised to ONNX the initializer is present but no node references it
+    → ORT warns.
+
+    Fix: model.graph.remove(node, safe=True) detaches the node from its inputs
+    first, so inp.uses() drops to 0 and RemoveUnusedNodesPass can prune it.
+    """
+    from mobius._optimizations import fold_initializers_after_weights
+
+    data = np.arange(12, dtype=np.float32).reshape(4, 3)
+    model, _, _ = _make_model_with_transpose(data, perm=[1, 0])
+
+    # Run the full pipeline (fold + remove unused) as in apply_weights.
+    fold_initializers_after_weights(model)
+
+    assert "weight_t" in model.graph.initializers, "Folded initializer must be present"
+    assert "weight" not in model.graph.initializers, (
+        "Original weight must be pruned by RemoveUnusedNodesPass after folding. "
+        "If it's still present, the Transpose node wasn't properly detached from "
+        "its inputs (safe=True missing), causing ORT 'unused initializer' warnings."
+    )
+
+    """Transpose(initializer) is skipped when the initializer has multiple consumers.
+
+    Folding would rename/remove the shared initializer, silently breaking the
+    other consumers. The pass must leave the graph unchanged in this case.
+    """
+    weight_data = np.ones((4, 8), dtype=np.float32)
+    weight_val = ir.Value(name="weight")
+    weight_val.shape = ir.Shape([4, 8])
+    weight_val.dtype = ir.DataType.FLOAT
+    weight_val.const_value = ir.tensor(weight_data)
+
+    x = ir.Value(name="x")
+    x.shape = ir.Shape([2, 4])
+    x.dtype = ir.DataType.FLOAT
+
+    # Consumer 1: Transpose(weight) → MatMul(x, w_t)
+    transpose_node = ir.Node(
+        "",
+        "Transpose",
+        inputs=[weight_val],
+        attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+        num_outputs=1,
+    )
+    w_t = transpose_node.outputs[0]
+    w_t.shape = ir.Shape([8, 4])
+    w_t.dtype = ir.DataType.FLOAT
+    matmul_node = ir.Node("", "MatMul", inputs=[x, w_t], num_outputs=1)
+
+    # Consumer 2: another MatMul that uses the raw (untransposed) weight directly,
+    # so the initializer has two uses: (transpose_node, 0) and (matmul2_node, 1).
+    x2 = ir.Value(name="x2")
+    x2.shape = ir.Shape([2, 8])
+    x2.dtype = ir.DataType.FLOAT
+    matmul2_node = ir.Node("", "MatMul", inputs=[x2, weight_val], num_outputs=1)
+
+    graph = ir.Graph(
+        inputs=[x, x2],
+        outputs=[matmul_node.outputs[0], matmul2_node.outputs[0]],
+        nodes=[transpose_node, matmul_node, matmul2_node],
+        name="test_graph",
+        opset_imports={"": 20},
+    )
+    graph.initializers["weight"] = weight_val
+
+    model = ir.Model(graph, ir_version=10)
+
+    # The initializer has 2 uses: Transpose and MatMul2 — folding must be skipped.
+    assert len(weight_val.uses()) == 2
+
+    result = FoldTransposedInitializerPass()(model)
+
+    # Pass must report no changes and the Transpose node must remain.
+    assert not result.modified
+    assert "weight_t" not in model.graph.initializers
+    transpose_nodes = [n for n in model.graph.all_nodes() if n.op_type == "Transpose"]
+    assert len(transpose_nodes) == 1
+
+
+class TestFoldTransposeDtype:
+    """Regression: a transposed fp16 weight with unset declared dtype stays fp16."""
+
+    def test_transposed_dtype_follows_const_value_when_declared_dtype_missing(self):
+        """fp16 weights lose their declared dtype after _cast_module_dtype.
+
+        The pass must resolve the transposed initializer's dtype from
+        ``const_value`` rather than defaulting to FLOAT, otherwise a fp16 weight
+        is emitted as fp32 and ORT rejects the downstream MatMul.
+        """
+        weight = ir.Value(name="weight")
+        weight.const_value = ir.tensor(np.arange(12, dtype=np.float16).reshape(4, 3))
+        # Do NOT set .dtype — declared dtype stays None.
+        assert weight.dtype is None
+
+        x = ir.Value(name="x")
+        x.shape = ir.Shape([2, 4])
+        x.dtype = ir.DataType.FLOAT16
+
+        transpose_node = ir.Node(
+            "",
+            "Transpose",
+            inputs=[weight],
+            attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+            num_outputs=1,
+        )
+        w_t = transpose_node.outputs[0]
+        matmul_node = ir.Node("", "MatMul", inputs=[x, w_t], num_outputs=1)
+
+        graph = ir.Graph(
+            inputs=[x],
+            outputs=[matmul_node.outputs[0]],
+            nodes=[transpose_node, matmul_node],
+            name="test_graph",
+            opset_imports={"": 20},
+        )
+        graph.register_initializer(weight)
+        model = ir.Model(graph, ir_version=10)
+
+        result = FoldTransposedInitializerPass()(model)
+        assert result.modified
+
+        packed = model.graph.initializers["weight_t"]
+        assert packed.dtype == ir.DataType.FLOAT16, (
+            f"Transposed initializer declared dtype should be FLOAT16, got {packed.dtype}"
+        )
+        assert packed.const_value.dtype == ir.DataType.FLOAT16
+        assert packed.const_value.numpy().dtype == np.float16
+
+
+def test_transpose_inside_loop_body_folds_against_root_initializer():
+    """A Transpose inside a Loop body, consuming an outer-scope initializer.
+
+    Folds correctly and registers the new pre-transposed initializer at the
+    root graph — not a per-name collision risk.
+
+    This documents (and guards) the invariant the pass's ``folded`` cache
+    relies on: it is keyed by initializer *name* only, and always inserts
+    into ``model.graph`` (the root), regardless of which (sub)graph the
+    consuming ``Transpose`` node actually lives in. That is only safe if two
+    *different* initializers can never share a name across sibling
+    subgraphs.
+
+    onnxscript's ``OpBuilder`` enforces exactly that: every initializer
+    (constant or parameter) is always registered on the **root** graph via
+    ``self._root._graph.register_initializer(...)`` (see
+    ``onnxscript._internal.builder``), even when the builder is currently
+    emitting into a Loop/If body. Subgraphs only ever reference outer-scope
+    initializers by name — they never declare their own local initializers.
+    So every mobius-built graph has a single, globally unique initializer
+    namespace by construction, and this pass's name-only cache can never
+    conflate two distinct initializers. This test builds a Loop body
+    manually (bypassing the builder) to pin that expectation directly.
+    """
+    weight_data = np.arange(6, dtype=np.float32).reshape(2, 3)
+    weight_val = ir.Value(name="weight")
+    weight_val.shape = ir.Shape([2, 3])
+    weight_val.dtype = ir.DataType.FLOAT
+    weight_val.const_value = ir.tensor(weight_data)
+
+    # Loop body: (iter_num, cond_in) -> (cond_out, y), with a Transpose of the
+    # *outer-scope* root initializer plus a MatMul against the loop-carried x.
+    iter_num = ir.Value(name="iter_num")
+    iter_num.dtype = ir.DataType.INT64
+    iter_num.shape = ir.Shape([])
+    cond_in = ir.Value(name="cond_in")
+    cond_in.dtype = ir.DataType.BOOL
+    cond_in.shape = ir.Shape([])
+    x_carried = ir.Value(name="x_carried")
+    x_carried.shape = ir.Shape([2, 2])
+    x_carried.dtype = ir.DataType.FLOAT
+
+    body_transpose = ir.Node(
+        "",
+        "Transpose",
+        inputs=[weight_val],
+        attributes=[ir.Attr("perm", ir.AttributeType.INTS, [1, 0])],
+        num_outputs=1,
+    )
+    body_w_t = body_transpose.outputs[0]
+    body_matmul = ir.Node("", "MatMul", inputs=[x_carried, body_w_t], num_outputs=1)
+    cond_out = ir.Node("", "Identity", inputs=[cond_in], num_outputs=1).outputs[0]
+
+    body_graph = ir.Graph(
+        inputs=[iter_num, cond_in, x_carried],
+        outputs=[cond_out, body_matmul.outputs[0]],
+        nodes=[body_transpose, body_matmul, cond_out.producer()],
+        name="loop_body",
+        opset_imports={"": 20},
+    )
+
+    x_init = ir.Value(name="x_init")
+    x_init.shape = ir.Shape([2, 2])
+    x_init.dtype = ir.DataType.FLOAT
+    trip_count = ir.Value(name="trip_count")
+    trip_count.dtype = ir.DataType.INT64
+    trip_count.shape = ir.Shape([])
+    cond = ir.Value(name="cond")
+    cond.dtype = ir.DataType.BOOL
+    cond.shape = ir.Shape([])
+
+    loop_node = ir.Node(
+        "",
+        "Loop",
+        inputs=[trip_count, cond, x_init],
+        attributes=[ir.Attr("body", ir.AttributeType.GRAPH, body_graph)],
+        num_outputs=1,
+    )
+
+    root_graph = ir.Graph(
+        inputs=[trip_count, cond, x_init],
+        outputs=[loop_node.outputs[0]],
+        nodes=[loop_node],
+        name="root_graph",
+        opset_imports={"": 20},
+    )
+    root_graph.register_initializer(weight_val)
+    model = ir.Model(root_graph, ir_version=10)
+
+    result = FoldTransposedInitializerPass()(model)
+    assert result.modified
+
+    # The pre-transposed initializer is registered at the root, and the
+    # subgraph's Transpose node is gone.
+    assert "weight_t" in model.graph.initializers
+    node_types = [n.op_type for n in model.graph.all_nodes()]
+    assert "Transpose" not in node_types
+
+    w_t = model.graph.initializers["weight_t"]
+    np.testing.assert_array_equal(w_t.const_value.numpy(), weight_data.T)
+
+
+def test_post_weight_pipeline_preserves_generic_layout_chain():
+    from mobius._optimizations import fold_initializers_after_weights
+
+    data = np.arange(24, dtype=np.uint8).reshape(2, 12)
+
+    def unexpected_read():
+        raise AssertionError("generic layout weights must remain untouched")
+
+    weight = ir.Value(
+        name="checkpoint.weight",
+        shape=ir.Shape(data.shape),
+        type=ir.TensorType(ir.DataType.UINT8),
+        const_value=ir.LazyTensor(
+            unexpected_read, dtype=ir.DataType.UINT8, shape=ir.Shape(data.shape)
+        ),
+    )
+    shapes = [
+        ir.Value(
+            name=name,
+            shape=ir.Shape([len(dimensions)]),
+            type=ir.TensorType(ir.DataType.INT64),
+            const_value=ir.tensor(np.array(dimensions, dtype=np.int64)),
+        )
+        for name, dimensions in (("split_shape", (2, 2, 6)), ("final_shape", (2, 12)))
+    ]
+    reshape = ir.Node("", "Reshape", [weight, shapes[0]], num_outputs=1)
+    transpose = ir.Node(
+        "",
+        "Transpose",
+        [reshape.outputs[0]],
+        attributes=[ir.AttrInt64s("perm", [0, 2, 1])],
+        num_outputs=1,
+    )
+    result = ir.Node("", "Reshape", [transpose.outputs[0], shapes[1]], num_outputs=1)
+    result.outputs[0].name = "reordered_weight"
+    nodes = [reshape, transpose, result]
+    model = ir.Model(
+        ir.Graph(
+            [],
+            [result.outputs[0]],
+            nodes=nodes,
+            initializers=[weight, *shapes],
+            opset_imports={"": 24},
+        ),
+        ir_version=10,
+    )
+
+    fold_initializers_after_weights(model)
+
+    assert list(model.graph) == nodes
+    assert model.graph.initializers["checkpoint.weight"] is weight
+    assert reshape.inputs[0] is weight
+    assert model.graph.outputs[0] is result.outputs[0]

@@ -1,0 +1,17 @@
+model_id: "bigscience/bloom-560m"
+model_type: "bloom"
+revision: "ac2ae5fab2ce3f9f40dc79b5ca9f637430d24971"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "BLOOM 560M. ALiBi positional encoding."

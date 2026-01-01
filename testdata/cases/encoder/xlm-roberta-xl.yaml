@@ -1,0 +1,14 @@
+model_id: "facebook/xlm-roberta-xl"
+model_type: "xlm-roberta-xl"
+revision: "main"
+task_type: "feature-extraction"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "The quick brown fox jumps over the lazy dog."
+
+skip_reason: "ORT InvalidArgument error during inference."
+level: "L4"
+
+notes: "XLM-RoBERTa XL. Extra-large multilingual encoder."

@@ -1,0 +1,4057 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Shared test configurations for all test tiers.
+
+Each config entry is a 3-tuple:
+    (model_type, config_overrides, is_representative)
+
+``is_representative=True`` means the model exercises unique behaviour
+(custom model class, softcapping, parallel attention, ALiBi, MoE, etc.)
+and should always be tested — including in ``--fast`` mode.  Models that
+are simple aliases of a base class with ``{}`` overrides are marked
+``False``.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+
+from mobius._configs import (
+    ArchitectureConfig,
+    AudioConfig,
+    BambaConfig,
+    CodecDecoderConfig,
+    CodecEncoderConfig,
+    DepthAnythingConfig,
+    FalconH1Config,
+    Gemma2Config,
+    Gemma3nAudioConfig,
+    Gemma3nConfig,
+    Gemma3nMultiModalConfig,
+    Gemma4Config,
+    GlmAsrConfig,
+    GraniteMoeHybridConfig,
+    GrokGGUFConfig,
+    GroveMoEGGUFConfig,
+    HyV3Config,
+    JambaConfig,
+    JetMoeConfig,
+    KimiK3Config,
+    KimiLinearConfig,
+    Lfm2Config,
+    Lfm2MoeConfig,
+    Lfm2VlConfig,
+    LongcatFlashConfig,
+    Mamba2Config,
+    MambaConfig,
+    MiniMaxConfig,
+    MllamaConfig,
+    MoonshineConfig,
+    MoonshineStreamingConfig,
+    MuseGlimmerConfig,
+    NanoChatConfig,
+    Nemotron3DiarizationConfig,
+    NemotronHConfig,
+    NemotronParseConfig,
+    ParakeetCTCConfig,
+    Plamo2Config,
+    Qwen4ExpConfig,
+    Sam2Config,
+    SegformerConfig,
+    SenseNovaU1Config,
+    VibeVoiceASRConfig,
+    VibeVoiceASRStreamingConfig,
+    VibeVoiceConfig,
+    VibeVoiceDiffusionConfig,
+    VibeVoiceStreamingConfig,
+    VibeVoiceStreamingDiffusionConfig,
+    VibeVoiceStreamingTokenizerConfig,
+    VibeVoiceTokenizerConfig,
+    VisionConfig,
+    WhisperConfig,
+    YolosConfig,
+    Zamba2Config,
+)
+from mobius.models import EsmConfig, ReUseConfig
+
+# ---------------------------------------------------------------------------
+# Tiny model dimensions shared by all configs
+# ---------------------------------------------------------------------------
+TINY_HIDDEN = 64
+TINY_INTERMEDIATE = 128
+TINY_HEADS = 4
+TINY_KV_HEADS = 2
+TINY_HEAD_DIM = TINY_HIDDEN // TINY_HEADS
+TINY_LAYERS = 2
+TINY_VOCAB = 256
+
+LONGROPE_FACTORS = [1.0] * (int(TINY_HEAD_DIM * 0.5) // 2)
+
+_TINY_MUSE_GLIMMER_TEXT_OVERRIDES = {
+    "_config_cls": MuseGlimmerConfig,
+    "num_hidden_layers": 4,
+    "layer_types": [
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+    ],
+    "layer_rope_theta": [500_000.0, 500_000.0, 500_000.0, 0],
+    "no_rope_layers": [3],
+    "sliding_window": 8,
+    "attn_qk_norm": True,
+    "qk_scale_factor": 3.87,
+    "output_multiplier": 0.19611613513818404,
+    "final_logit_softcapping": 20.0,
+    "post_norm_eps": 1e-8,
+}
+
+_TINY_QWEN4_EXP_OVERRIDES = {
+    "_config_cls": Qwen4ExpConfig,
+    "num_hidden_layers": 4,
+    "layer_types": [
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "qwen_sparse_attention",
+    ],
+    "partial_rotary_factor": 0.25,
+    "linear_num_value_heads": 4,
+    "linear_num_key_heads": 2,
+    "linear_key_head_dim": 16,
+    "linear_value_head_dim": 16,
+    "linear_conv_kernel_dim": 4,
+    "num_local_experts": 4,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 32,
+    "shared_expert_intermediate_size": 32,
+    "hc_count": 2,
+    "hc_lowrank": 8,
+    "indexer_n_heads": 2,
+    "indexer_kv_heads": 1,
+    "indexer_head_dim": 16,
+    "indexer_budget": 4,
+    "indexer_compress_ratio": 2,
+    "ple_layer_ids": [2],
+    "ple_embed_dim": 16,
+    "ple_conv_kernel_size": 2,
+    "ngram_size": 3,
+    "heads_per_ngram": 2,
+    "ngram_vocab_size_base": 31,
+    "make_ngram_vocab_size_divisible_by": 8,
+    "split_ngram_parts": 4,
+    "eos_token_id": 1,
+    "mtp_num_hidden_layers": 0,
+}
+
+# NOTE (MLA models): Multi-head Latent Attention models (DeepSeek-V2/V3,
+# LongCat-Flash, ...) reconstruct full-head K/V from a shared latent, so they do
+# not use grouped-query attention.  Their tiny configs must set
+# num_key_value_heads == num_attention_heads; otherwise HuggingFace's repeat_kv()
+# in the SDPA path duplicates the already-full-head K/V tensors, producing a
+# head-count mismatch against the query.
+
+
+def _base_config(config_cls=None, **overrides) -> ArchitectureConfig:
+    """Create a tiny ArchitectureConfig for graph-build and parity tests.
+
+    Applies a set of small defaults (hidden_size=64, 2 layers, etc.) and
+    merges caller-supplied *overrides*.  Unknown fields are filtered out for
+    dataclass-based config classes so that specialised configs (e.g.
+    MambaConfig) that lack ``rope_*`` fields don't fail on construction.
+    """
+    if config_cls is None:
+        config_cls = overrides.pop("_config_cls", ArchitectureConfig)
+    else:
+        overrides.pop("_config_cls", None)
+    defaults = dict(
+        hidden_size=TINY_HIDDEN,
+        intermediate_size=TINY_INTERMEDIATE,
+        num_attention_heads=TINY_HEADS,
+        num_key_value_heads=TINY_KV_HEADS,
+        head_dim=TINY_HEAD_DIM,
+        num_hidden_layers=TINY_LAYERS,
+        vocab_size=TINY_VOCAB,
+        max_position_embeddings=128,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        rope_type="default",
+        rope_theta=10_000.0,
+        pad_token_id=0,
+    )
+    defaults.update(overrides)
+    # Filter out fields not accepted by the config class (e.g. MambaConfig
+    # doesn't have max_position_embeddings or rope_* fields).
+    if dataclasses.is_dataclass(config_cls):
+        valid_fields = {f.name for f in dataclasses.fields(config_cls)}
+        defaults = {k: v for k, v in defaults.items() if k in valid_fields}
+    return config_cls(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# Causal LM configs  (task: text-generation / hybrid-text-generation)
+# ---------------------------------------------------------------------------
+CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = [
+    # === Text Generation (Llama-compatible) ===
+    ("llama", {}, True),
+    (
+        "bitnet",
+        {
+            "hidden_act": "relu2",
+            "tie_word_embeddings": True,
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
+    (
+        "talkie",
+        {
+            "hidden_act": "silu",
+            "tie_word_embeddings": False,
+            "rms_norm_eps": 1e-5,
+            "logit_scale": 0.5,
+        },
+        True,
+    ),
+    (
+        "maincoder",
+        {
+            "hidden_act": "silu",
+            "tie_word_embeddings": True,
+            "rms_norm_eps": 1e-5,
+            "rope_interleave": True,
+        },
+        True,
+    ),
+    (
+        "lfm2",
+        {
+            "_config_cls": Lfm2Config,
+            "layer_types": ["conv", "full_attention"],
+            "attn_qk_norm": True,
+            "short_conv_kernel": 3,
+            "short_conv_bias": False,
+        },
+        True,
+    ),
+    (
+        "lfm2_moe",
+        {
+            "_config_cls": Lfm2MoeConfig,
+            "layer_types": ["conv", "full_attention"],
+            "attn_qk_norm": True,
+            "short_conv_kernel": 3,
+            "short_conv_bias": False,
+            "num_dense_layers": 1,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "norm_topk_prob": True,
+            "routed_scaling_factor": 1.0,
+            "use_expert_bias": True,
+            "tie_word_embeddings": True,
+        },
+        True,
+    ),
+    ("mistral", {}, False),
+    ("qwen2", {}, True),
+    ("muse_glimmer_text", dict(_TINY_MUSE_GLIMMER_TEXT_OVERRIDES), True),
+    ("cohere", {"tie_word_embeddings": True, "logit_scale": 0.0625}, True),
+    ("cohere2", {"tie_word_embeddings": True, "logit_scale": 0.0625}, False),
+    (
+        "cosmos3_edge_text",
+        {"hidden_act": "relu2", "mlp_bias": False, "mrope_section": [24, 20, 20]},
+        True,
+    ),
+    ("diffllama", {}, False),
+    ("doge", {}, False),
+    (
+        "dots1",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 2.5,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "first_k_dense_replace": 1,
+            "n_shared_experts": 2,
+            "attn_qk_norm": True,
+        },
+        False,
+    ),
+    ("exaone4", {}, False),
+    (
+        "glm",
+        {"attn_qkv_bias": True},
+        False,
+    ),
+    (
+        "glm4",
+        {"attn_qkv_bias": True},
+        False,
+    ),
+    ("helium", {}, False),
+    ("hunyuan_v1_dense", {}, False),
+    ("llama4_text", {}, False),
+    ("ministral", {}, False),
+    ("ministral3", {}, False),
+    (
+        "nanochat",
+        {
+            "_config_cls": NanoChatConfig,
+            "hidden_act": "relu2",
+            "final_logit_softcapping": 15.0,
+        },
+        True,
+    ),
+    (
+        "olmo2",
+        {"attn_qk_norm": True, "attn_qk_norm_full": True},
+        True,
+    ),
+    (
+        "olmo3",
+        {"attn_qk_norm": True, "attn_qk_norm_full": True},
+        False,
+    ),
+    (
+        "qwen3_5_text",
+        {
+            "partial_rotary_factor": 0.5,
+            "layer_types": ["full_attention", "linear_attention"],
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+        },
+        False,
+    ),
+    (
+        "qwen3_next",
+        {
+            "hidden_act": "silu",
+            "layer_types": [
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ],
+            "num_hidden_layers": 4,
+            "partial_rotary_factor": 0.25,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "norm_topk_prob": True,
+            "attn_qk_norm": True,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+        },
+        True,
+    ),
+    (
+        "qwen4_exp_text",
+        dict(_TINY_QWEN4_EXP_OVERRIDES),
+        True,
+    ),
+    ("solar_open", {}, False),
+    ("stablelm", {"partial_rotary_factor": 0.25}, True),
+    (
+        "starcoder2",
+        {"hidden_act": "gelu_pytorch_tanh", "tie_word_embeddings": True},
+        True,
+    ),
+    (
+        "youtu",
+        {
+            "q_lora_rank": 32,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "tie_word_embeddings": True,
+        },
+        False,
+    ),
+    # === Absolute positional embeddings (non-RoPE) ===
+    (
+        "ctrl",
+        {
+            # HF CTRL FFN uses ReLU (not gelu_new); token embeds scaled by sqrt(n_embd)
+            "hidden_act": "relu",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attention_bias": True,
+        },
+        True,
+    ),
+    (
+        "gpt2",
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
+    (
+        "imagegpt",
+        {"hidden_act": "gelu_new", "tie_word_embeddings": True},
+        False,
+    ),
+    (
+        "opt",
+        {
+            "hidden_act": "relu",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            # HF OPT uses eps=1e-5 for its LayerNorms (nn.LayerNorm default)
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
+    (
+        "xlm",
+        {
+            # HF XLM uses standard GELU (erf-based) and eps=1e-12 for LayerNorms
+            "hidden_act": "gelu",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            # XLM uses 4*emb_dim for feedforward (hardcoded in HF)
+            "intermediate_size": 4 * TINY_HIDDEN,
+            # HF XLM uses eps=1e-12 for all LayerNorms
+            "rms_norm_eps": 1e-12,
+        },
+        False,
+    ),
+    # === Other Llama-compatible ===
+    # ModernBERT-Decoder uses MHA only (HF sets kv_heads=num_heads internally);
+    # set num_key_value_heads=TINY_HEADS to match.
+    ("modernbert-decoder", {"num_key_value_heads": TINY_HEADS}, False),
+    # === Text Generation (architecture-specific) ===
+    (
+        "gemma",
+        {"attn_qkv_bias": False, "attn_o_bias": False},
+        True,
+    ),
+    (
+        "gemma2",
+        {
+            "_config_cls": Gemma2Config,
+            "attn_qkv_bias": False,
+            "attn_o_bias": False,
+            "attn_logit_softcapping": 50.0,
+            "final_logit_softcapping": 30.0,
+            "query_pre_attn_scalar": TINY_HEAD_DIM,
+        },
+        True,
+    ),
+    (
+        "shieldgemma2",
+        {
+            "_config_cls": Gemma2Config,
+            "attn_qkv_bias": False,
+            "attn_o_bias": False,
+            "attn_logit_softcapping": 50.0,
+            "final_logit_softcapping": 30.0,
+            "query_pre_attn_scalar": TINY_HEAD_DIM,
+        },
+        False,
+    ),
+    (
+        "gemma3_text",
+        {
+            "attn_qk_norm": True,
+            "rope_local_base_freq": 10_000.0,
+            "layer_types": ["full_attention", "sliding_attention"],
+        },
+        True,
+    ),
+    (
+        "gemma4_text",
+        {
+            "_config_cls": Gemma4Config,
+            "attn_qk_norm": True,
+            "rope_local_base_freq": 10_000.0,
+            # 2-layer test: 1 sliding + 1 full (must match TINY_LAYERS=2)
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+            "global_head_dim": TINY_HEAD_DIM,
+            "global_rope_theta": 10_000.0,
+            "final_logit_softcapping": 30.0,
+            # Per-layer embedding: small dim to match HF (default 256)
+            "hidden_size_per_layer_input": 32,
+            "vocab_size_per_layer_input": TINY_VOCAB,
+        },
+        True,
+    ),
+    (
+        # gemma-4-12B text backbone (reuses Gemma4CausalLMModel): dual head_dim
+        # (local 16 / global 32), single global KV head with attention_k_eq_v,
+        # vision-block bidirectional attention.  Built generically here; numeric
+        # parity is covered by the real-weight integration test (no HF model_type
+        # for this internal alias, so it is excluded from synthetic parity).
+        "gemma4_unified_text",
+        {
+            "_config_cls": Gemma4Config,
+            "hidden_act": "gelu_pytorch_tanh",
+            "attn_qk_norm": True,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+            "global_head_dim": 2 * TINY_HEAD_DIM,
+            "global_rope_theta": 1_000_000.0,
+            "global_partial_rotary_factor": 0.25,
+            "final_logit_softcapping": 30.0,
+            "hidden_size_per_layer_input": 0,
+            "num_global_key_value_heads": 1,
+            "attention_k_eq_v": True,
+            "use_bidirectional_attention": "vision",
+            "tie_word_embeddings": True,
+        },
+        False,
+    ),
+    (
+        "gemma3n_text",
+        {
+            "_config_cls": Gemma3nConfig,
+            "attn_qk_norm": True,
+            "hidden_act": "gelu_pytorch_tanh",
+            "rope_local_base_freq": 10_000.0,
+            "layer_types": ["full_attention", "sliding_attention"],
+            "altup_num_inputs": 2,
+            "altup_active_idx": 0,
+            "altup_correct_scale": True,
+            "laurel_rank": 16,
+            "hidden_size_per_layer_input": 32,
+            "vocab_size_per_layer_input": 256,
+            # Mixed layer_types with TINY_LAYERS=2 leaves no same-type source
+            # layer to borrow K,V from; sharing is covered by the
+            # all-full-attention gemma3n_text entry below.
+            "num_kv_shared_layers": 0,
+            # Layer 0 sparse, layer 1 dense: covers both branches of the
+            # activation-sparsity fork in Gemma3nMLP.
+            "activation_sparsity_pattern": [0.95, 0.0],
+        },
+        True,
+    ),
+    # NOTE: the "gemma3n" registry key builds the *multimodal* model
+    # (Gemma3nMultiModalModel), so its entry lives in VL_CONFIGS.  The text
+    # decoder is covered by the two "gemma3n_text" entries.
+    ("granite", {}, True),
+    ("olmo", {}, False),
+    ("internlm2", {"attn_qkv_bias": True}, True),
+    (
+        "nemotron",
+        {
+            "hidden_act": "relu2",
+            "partial_rotary_factor": 0.5,
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
+    (
+        "phi3",
+        {
+            "partial_rotary_factor": 0.5,
+            "rope_type": "longrope",
+            "rope_scaling": {
+                "short_factor": LONGROPE_FACTORS,
+                "long_factor": LONGROPE_FACTORS,
+            },
+            "original_max_position_embeddings": 128,
+        },
+        True,
+    ),
+    ("qwen3", {"attn_qk_norm": True}, True),
+    (
+        "qwen3_5_text",
+        {
+            "partial_rotary_factor": 0.5,
+            "layer_types": ["linear_attention", "full_attention"],
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+        },
+        True,
+    ),
+    ("qwen3_vl_text", {"attn_qk_norm": True}, False),
+    ("smollm3", {"no_rope_layers": [1, 0]}, True),  # exercise per-layer RoPE gating
+    (
+        "smallthinker_gguf",
+        {
+            "hidden_act": "relu",
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "scoring_func": "softmax",
+            "norm_topk_prob": True,
+            "routing_weight_normalization_floor": 6.103515625e-5,
+            "layer_types": ["full_attention", "sliding_attention"],
+            "no_rope_layers": [0, 1],
+            "sliding_window": 16,
+            "rope_local_base_freq": 50_000.0,
+        },
+        True,
+    ),
+    (
+        "minimax_m2_gguf",
+        {
+            "hidden_act": "silu",
+            "head_dim": 16,
+            "partial_rotary_factor": 0.5,
+            "attn_qk_norm": True,
+            "attn_qk_norm_full": True,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "scoring_func": "sigmoid",
+            "norm_topk_prob": True,
+            "routing_weight_normalization_floor": 6.103515625e-5,
+            "use_expert_bias": True,
+            "disable_qmoe": True,
+        },
+        True,
+    ),
+    # === Mixture of Experts ===
+    (
+        "phimoe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "partial_rotary_factor": 0.5,
+            "rope_type": "longrope",
+            "rope_scaling": {
+                "short_factor": LONGROPE_FACTORS,
+                "long_factor": LONGROPE_FACTORS,
+            },
+            "original_max_position_embeddings": 128,
+        },
+        True,
+    ),
+    (
+        "phimoe_gguf",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "partial_rotary_factor": 0.5,
+            "rope_type": "longrope",
+            "rope_scaling": {
+                "short_factor": LONGROPE_FACTORS,
+                "long_factor": LONGROPE_FACTORS,
+            },
+            "original_max_position_embeddings": 128,
+        },
+        True,
+    ),
+    (
+        "granitemoe",
+        {"num_local_experts": 4, "num_experts_per_tok": 2},
+        True,
+    ),
+    (
+        "mixtral",
+        {"num_local_experts": 4, "num_experts_per_tok": 2},
+        True,
+    ),
+    (
+        "olmoe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "attn_qk_norm": True,
+            "attn_qk_norm_full": True,
+        },
+        False,
+    ),
+    (
+        "qwen2_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 64,
+            "attn_qkv_bias": True,
+        },
+        True,
+    ),
+    (
+        "qwen3_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "attn_qk_norm": True,
+        },
+        True,
+    ),
+    (
+        "dream",
+        {
+            "attn_qkv_bias": True,
+        },
+        True,
+    ),
+    ("Dream", {"attn_qkv_bias": True}, False),
+    (
+        "llada_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64,
+            "attn_qk_norm": True,
+            "norm_topk_prob": False,
+        },
+        True,
+    ),
+    (
+        "LLaDAMoEModel",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64,
+            "attn_qk_norm": True,
+            "norm_topk_prob": False,
+        },
+        False,
+    ),
+    (
+        "rnd1",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64,
+            "attn_qk_norm": True,
+            "norm_topk_prob": True,
+            "tie_word_embeddings": True,
+        },
+        True,
+    ),
+    (
+        "qwen3_5_moe",
+        {
+            "hidden_act": "silu",
+            "layer_types": ["linear_attention", "full_attention"],
+            "partial_rotary_factor": 0.25,
+            "mrope_interleaved": True,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+        },
+        True,
+    ),
+    # Text-only sibling of the Qwen3.5-MoE-VL (Qwen3.6-35B-A3B) checkpoint,
+    # exported via ``build(..., text_only=True)``. Same hybrid MoE backbone as
+    # ``qwen3_5_moe`` above; registered separately so the VL ``text_config``'s
+    # ``model_type=qwen3_5_moe_text`` and the text-only override both resolve.
+    (
+        "qwen3_5_moe_text",
+        {
+            "hidden_act": "silu",
+            "layer_types": ["linear_attention", "full_attention"],
+            "partial_rotary_factor": 0.25,
+            "mrope_interleaved": True,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+        },
+        True,
+    ),
+    # === Falcon and Bloom ===
+    # dual_ln=True: Falcon with new_decoder_architecture uses separate ln_attn + ln_mlp.
+    # hidden_act="gelu": real Falcon uses GELU (HF FalconConfig.activation default);
+    # the generic _base_config default is "silu", so set it explicitly to match HF.
+    ("falcon", {"parallel_attn": True, "dual_ln": True, "hidden_act": "gelu"}, True),
+    (
+        "bloom",
+        {
+            "alibi": True,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+            "num_key_value_heads": TINY_HEADS,
+            "intermediate_size": 4 * TINY_HIDDEN,
+        },
+        True,
+    ),
+    # === Additional Llama-compatible aliases ===
+    ("baichuan", {}, False),
+    ("codegen2", {}, False),
+    ("command_r", {}, False),
+    (
+        "jais2",
+        {
+            "hidden_act": "relu2",
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+        },
+        False,
+    ),
+    (
+        "kclgpt",
+        {
+            "hidden_act": "gelu_pytorch_tanh",
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+            "tie_word_embeddings": True,
+        },
+        False,
+    ),
+    ("xverse", {}, False),
+    (
+        "plm",
+        {
+            "num_key_value_heads": TINY_HEADS,
+            "head_dim": 24,
+            "q_lora_rank": None,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "hidden_act": "relu2",
+            "tie_word_embeddings": True,
+            "rope_interleave": True,
+        },
+        True,
+    ),
+    # === DeepSeek (MLA + MoE) ===
+    (
+        "deepseek",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 1.0,
+            "norm_topk_prob": False,
+            "scoring_func": "softmax",
+            "topk_method": "greedy",
+            "first_k_dense_replace": 1,
+            "n_shared_experts": 1,
+        },
+        False,
+    ),
+    (
+        "deepseek_v3",
+        {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
+            "q_lora_rank": 32,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_group": 2,
+            "topk_group": 1,
+            "routed_scaling_factor": 2.5,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "first_k_dense_replace": 1,
+            "n_shared_experts": 1,
+            "rope_interleave": True,
+            "rope_type": "yarn",
+            "rope_scaling": {
+                "factor": 4.0,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 128,
+            },
+        },
+        True,
+    ),
+    # glm_moe_dsa (zai-org/GLM-5.2): DeepSeekV3CausalLMModel subclass adding
+    # DeepSeek Sparse Attention (DSA) indexers on top of MLA. Field values
+    # below are shape-shrunk from the real zai-org/GLM-5.2 config.json
+    # (n_group=1, topk_group=1, routed_scaling_factor=2.5, sigmoid/noaux_tc,
+    # index_n_heads=32->2, index_head_dim=128->8, index_topk=2048->4). The
+    # real checkpoint config also sets num_nextn_predict_layers=1 (it ships
+    # model.layers.<num_hidden_layers>.* MTP weights), but the reference
+    # transformers.models.glm_moe_dsa modeling code only builds
+    # range(num_hidden_layers) decoder layers and has no MTP module, so those
+    # weights are unused/unexpected keys under from_pretrained -- see
+    # glm_moe_dsa.py for the matching drop-with-capability-message behavior.
+    (
+        "glm_moe_dsa",
+        {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
+            "q_lora_rank": 32,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 2.5,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "first_k_dense_replace": 1,
+            "n_shared_experts": 1,
+            "rope_interleave": True,
+            "index_n_heads": 2,
+            "index_head_dim": 8,
+            "index_topk": 4,
+            "index_topk_freq": None,
+            "indexer_types": ["full", "shared"],
+            "num_nextn_predict_layers": 1,
+        },
+        True,
+    ),
+    (
+        "deepseek_v4",
+        {
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "q_lora_rank": 32,
+            "qk_rope_head_dim": 8,
+            "o_groups": 2,
+            "o_lora_rank": 16,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_shared_experts": 1,
+            "routed_scaling_factor": 1.5,
+            "scoring_func": "sqrtsoftplus",
+            "num_hash_layers": 1,
+            "hc_mult": 2,
+            "hc_sinkhorn_iters": 2,
+            "swiglu_limit": 10.0,
+            "rope_interleave": True,
+            "rope_type": "yarn",
+            "rope_scaling": {
+                "factor": 4.0,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "original_max_position_embeddings": 128,
+            },
+            # Official reference unconditionally restricts every layer to
+            # this many most-recent positions (`get_window_topk_idxs`),
+            # regardless of `compress_ratios` -- see
+            # `DeepSeekV4Attention.local_window_size`. Matches the
+            # `sliding_window: 8` tiny-config convention used by
+            # gemma/gemma4/muse-glimmer above; exercised end-to-end by
+            # `deepseek_v4_flash_test.py`'s dedicated window tests (this
+            # entry's forward-executing consumers currently use a shorter
+            # sequence length and/or are skipped for deepseek_v4 for
+            # unrelated pre-existing reasons, so this value isn't itself
+            # numerically exercised by the generic parity/build/
+            # weight-alignment suites).
+            "sliding_window": 8,
+        },
+        True,
+    ),
+    (
+        "deepseek_v2",
+        {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
+            "q_lora_rank": 32,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_group": 2,
+            "topk_group": 1,
+            "routed_scaling_factor": 1.0,
+            "scoring_func": "softmax",
+            "topk_method": "group_limited_greedy",
+            "first_k_dense_replace": 1,
+            "n_shared_experts": 1,
+        },
+        True,
+    ),
+    ("exaone", {}, False),
+    # deepseek_v2_moe: same config as deepseek_v2 (MoE variant alias)
+    (
+        "deepseek_v2_moe",
+        {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
+            "q_lora_rank": 32,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_group": 2,
+            "topk_group": 1,
+            "routed_scaling_factor": 1.0,
+            "scoring_func": "softmax",
+            "topk_method": "group_limited_greedy",
+            "first_k_dense_replace": 1,
+            "n_shared_experts": 1,
+        },
+        False,
+    ),
+    # DeepSeek-V2 without MLA (standard attention + MoE, like OCR-2 LLM)
+    (
+        "deepseek_v2",
+        {
+            "qk_nope_head_dim": 0,
+            "qk_rope_head_dim": 0,
+            "v_head_dim": 0,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 1.0,
+            "scoring_func": "softmax",
+            "topk_method": "greedy",
+            "first_k_dense_replace": 1,
+            "n_shared_experts": 2,
+        },
+        True,
+    ),
+    ("minicpm", {}, True),
+    ("minicpm3", {}, True),
+    (
+        "minicpm_gguf",
+        {
+            "embedding_multiplier": 12.0,
+            "residual_multiplier": 1.4 / TINY_LAYERS**0.5,
+            "logits_scaling": TINY_HIDDEN / 256.0,
+        },
+        True,
+    ),
+    (
+        "minicpm3_gguf",
+        {
+            "head_dim": TINY_HEAD_DIM,
+            "num_key_value_heads": TINY_HEADS,
+            "q_lora_rank": TINY_HEAD_DIM,
+            "kv_lora_rank": TINY_HEAD_DIM,
+            "qk_nope_head_dim": TINY_HEAD_DIM // 2,
+            "qk_rope_head_dim": TINY_HEAD_DIM // 2,
+            "v_head_dim": TINY_HEAD_DIM // 2,
+            "embedding_multiplier": 12.0,
+            "residual_multiplier": 1.4 / TINY_LAYERS**0.5,
+            "logits_scaling": TINY_HIDDEN / 256.0,
+            "rope_interleave": False,
+        },
+        True,
+    ),
+    ("openelm", {}, True),
+    (
+        "persimmon",
+        {
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+            "num_key_value_heads": TINY_HEADS,
+            "partial_rotary_factor": 0.5,
+            "hidden_act": "relu2",
+            # HF Persimmon uses layer_norm_eps=1e-5
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
+    ("yi", {}, False),
+    ("zamba", {}, True),
+    # === Architecture-specific (untested classes) ===
+    ("chatglm", {}, True),
+    ("ernie4_5", {}, True),
+    (
+        "gemma3_text",
+        {
+            "attn_qk_norm": True,
+            "rope_local_base_freq": 10_000.0,
+            "layer_types": ["full_attention", "sliding_attention"],
+        },
+        False,
+    ),
+    (
+        "phi",
+        {
+            "partial_rotary_factor": 0.5,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+            "hidden_act": "gelu_new",
+        },
+        True,
+    ),
+    ("phi3small", {"partial_rotary_factor": 0.5}, True),
+    ("qwen", {}, True),
+    # === MoE aliases ===
+    (
+        "arctic",
+        {"num_local_experts": 4, "num_experts_per_tok": 2},
+        False,
+    ),
+    (
+        "arctic_gguf",
+        {"num_local_experts": 4, "num_experts_per_tok": 2},
+        False,
+    ),
+    (
+        "dbrx",
+        {"num_local_experts": 4, "num_experts_per_tok": 2},
+        False,
+    ),
+    (
+        "dbrx_gguf",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "attention_clamp": 8.0,
+            "tie_word_embeddings": False,
+        },
+        False,
+    ),
+    (
+        "grok_gguf",
+        {
+            "_config_cls": GrokGGUFConfig,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "hidden_act": "gelu_new",
+            "has_dense_ffn": True,
+            "has_gated_dense_ffn": True,
+            "has_gated_experts": True,
+        },
+        True,
+    ),
+    (
+        "grovemoe_gguf",
+        {
+            "_config_cls": GroveMoEGGUFConfig,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "chunk_expert_intermediate_size": 16,
+            "experts_per_group": 2,
+            "expert_group_scale": 0.05,
+            "attn_qk_norm": True,
+            "hidden_act": "silu",
+        },
+        True,
+    ),
+    (
+        "hunyuan_moe_gguf",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": TINY_INTERMEDIATE,
+            "shared_expert_intermediate_size": TINY_INTERMEDIATE,
+            "attn_qk_norm": True,
+            "hidden_act": "silu",
+        },
+        True,
+    ),
+    (
+        "jetmoe",
+        {
+            "_config_cls": JetMoeConfig,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "head_dim": TINY_HEAD_DIM,  # kv_channels = head_dim; not hidden/num_heads
+            # num_attention_heads = num_experts_per_tok * num_kv_heads = 2 * 2 = 4 (TINY_HEADS)
+        },
+        False,
+    ),
+    # === Additional CausalLM aliases ===
+    ("apertus", {}, False),
+    ("arcee", {"hidden_act": "relu2"}, False),
+    ("code_llama", {}, False),
+    (
+        "codegen",
+        {
+            "partial_rotary_factor": 0.5,
+            "mlp_bias": True,
+            "num_key_value_heads": TINY_HEADS,
+            "hidden_act": "gelu_new",
+            # HF CodeGen defaults to layer_norm_epsilon=1e-5
+            "rms_norm_eps": 1e-5,
+        },
+        False,
+    ),
+    ("csm", {}, False),
+    ("evolla", {}, False),
+    (
+        "gpt_neox",
+        {
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+            "num_key_value_heads": TINY_HEADS,
+            "hidden_act": "gelu",
+            # HF GPT-NeoX defaults to partial_rotary_factor=0.25
+            "partial_rotary_factor": 0.25,
+        },
+        False,
+    ),
+    (
+        "gpt_neox_japanese",
+        {
+            # GPT-NeoX-Japanese has NO QKV bias (only a separate dense_bias for output proj)
+            "attn_qkv_bias": False,
+            "attn_o_bias": True,
+            "mlp_bias": False,
+            "num_key_value_heads": TINY_HEADS,
+            "hidden_act": "gelu",
+            # NOTE: HF GPT-NeoX-Japanese reads partial_rotary_factor from config.rope_parameters,
+            # not from a top-level field. HF default is 1.0 (full rotary). Use 1.0 here so both
+            # ONNX and HF apply rotary to all head_dim dimensions.
+            # GPT-NeoX-Japanese uses intermediate_multiple_size (default 4) not intermediate_size
+            "intermediate_size": 4 * TINY_HIDDEN,
+            # HF GPT-NeoX-Japanese uses layer_norm_eps=1e-5 by default; match it
+            "rms_norm_eps": 1e-5,
+        },
+        False,
+    ),
+    (
+        "gptj",
+        {
+            "partial_rotary_factor": 0.25,
+            "mlp_bias": True,
+            "num_key_value_heads": TINY_HEADS,
+            "hidden_act": "gelu_new",
+            # HF GPT-J defaults to layer_norm_epsilon=1e-5
+            "rms_norm_eps": 1e-5,
+        },
+        False,
+    ),
+    (
+        "longcat_flash",
+        {
+            "_config_cls": LongcatFlashConfig,
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
+            "q_lora_rank": 16,
+            "kv_lora_rank": 8,
+            "qk_nope_head_dim": 8,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 8,
+            "num_local_experts": 4,
+            "zero_expert_num": 2,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 16,
+            "routed_scaling_factor": 1.0,
+            "intermediate_size": TINY_INTERMEDIATE,
+            "num_hidden_layers": TINY_LAYERS * 2,
+            "rope_interleave": True,
+        },
+        True,
+    ),
+    ("open-llama", {}, False),
+    # seed_oss uses attention_bias=True by default (HF always has q/k/v biases).
+    # Set attn_qkv_bias=True so our ONNX model also has these biases for parity.
+    ("seed_oss", {"attn_qkv_bias": True}, False),
+    # zamba2: hybrid Mamba2+Attention (requires Zamba2Config)
+    # Physical layers [mamba, mamba, hybrid, mamba] expand to 5 logical layers.
+    # head_dim = attention_hidden_size / num_attention_heads (not hidden_size / heads)
+    (
+        "zamba2",
+        {
+            "_config_cls": Zamba2Config,
+            "num_hidden_layers": 5,
+            "layer_types": [
+                "mamba2",
+                "mamba2",
+                "full_attention",
+                "mamba2",
+                "mamba2",
+            ],
+            "head_dim": 2 * TINY_HIDDEN // TINY_HEADS,
+            "mamba_n_heads": 4,
+            "mamba_d_head": 32,
+            "mamba_d_state": 8,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "attention_hidden_size": 2 * TINY_HIDDEN,
+            "num_mem_blocks": 1,
+            "adapter_rank": 8,
+            "hybrid_layer_indices": [2],
+            "num_key_value_heads": TINY_HEADS,
+            "mamba_time_step_min": 0.001,
+        },
+        True,
+    ),
+    # === Additional GPT2 aliases ===
+    # num_key_value_heads=TINY_HEADS: GPT-2 family never uses GQA; setting
+    # kv_heads = num_heads ensures ONNX KV-cache and HF weight shapes agree.
+    # attn_qkv_bias / attn_o_bias: all GPT-2 family models use attention biases.
+    (
+        "biogpt",
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+        },
+        False,
+    ),
+    (
+        "gpt-sw3",
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+        },
+        False,
+    ),
+    (
+        "gpt_bigcode",
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "rms_norm_eps": 1e-5,
+        },
+        False,
+    ),
+    (
+        "gpt_neo",
+        # GPT-Neo does not scale attention (no 1/sqrt(head_dim)), so set attention_multiplier=1.0.
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": False,
+            "attn_o_bias": True,
+            "rms_norm_eps": 1e-5,
+            "attention_multiplier": 1.0,
+        },
+        False,
+    ),
+    (
+        "openai-gpt",
+        # OpenAI-GPT uses post-norm (attn → residual+norm) instead of GPT-2 pre-norm.
+        # Also: always uses 4 * n_embd for MLP; no n_inner config option.
+        # No final LayerNorm (ln_f injected as identity in preprocess_weights).
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "intermediate_size": 4 * TINY_HIDDEN,
+            "post_norm": True,
+            "rms_norm_eps": 1e-5,
+        },
+        False,
+    ),
+    (
+        "xglm",
+        {
+            "hidden_act": "gelu_new",
+            "tie_word_embeddings": True,
+            "num_key_value_heads": TINY_HEADS,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+        },
+        False,
+    ),
+    # === Additional Falcon aliases ===
+    (
+        "mpt",
+        {
+            "num_key_value_heads": TINY_HEADS,
+            "hidden_act": "gelu",
+            # MPT hardcodes 4*hidden_size; set our intermediate_size to match
+            "intermediate_size": 4 * TINY_HIDDEN,
+        },
+        False,
+    ),
+    # === Additional MoE aliases ===
+    (
+        "bailing_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 128,
+        },
+        False,
+    ),
+    (
+        "ernie4_5_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 128,
+        },
+        False,
+    ),
+    (
+        "ernie4_5_moe_gguf",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 128,
+            "first_k_dense_replace": 1,
+            "moe_layer_frequency": 1,
+            "scoring_func": "softmax",
+            "use_expert_bias": True,
+            "routing_weight_normalization_floor": 6.103515625e-5,
+        },
+        False,
+    ),
+    (
+        "flex_olmo",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "attn_qk_norm": True,
+            "attn_qk_norm_full": True,
+            "post_feedforward_norm": True,
+        },
+        False,
+    ),
+    (
+        "glm4_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 128,
+        },
+        False,
+    ),
+    (
+        "glm4v_text",
+        {"attn_qkv_bias": True},
+        False,
+    ),
+    (
+        "glm4v_moe_text",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 128,
+            "shared_expert_intermediate_size": 128,
+        },
+        False,
+    ),
+    (
+        "qwen3_omni_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": TINY_INTERMEDIATE,
+            "attn_qk_norm": True,
+        },
+        False,
+    ),
+    (
+        "qwen3_vl_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": TINY_INTERMEDIATE,
+            "attn_qk_norm": True,
+        },
+        False,
+    ),
+    (
+        "granitemoehybrid",
+        {
+            "_config_cls": GraniteMoeHybridConfig,
+            "layer_types": ["mamba2", "full_attention"],
+            "mamba_n_heads": 4,
+            "mamba_d_head": 32,
+            "mamba_d_state": 8,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "shared_intermediate_size": 32,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+        },
+        True,
+    ),
+    (
+        "granitemoeshared",
+        {"num_local_experts": 4, "num_experts_per_tok": 2},
+        False,
+    ),
+    (
+        "hunyuan_v1_moe",
+        {
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "attn_qk_norm": True,
+            "shared_expert_intermediate_size": TINY_INTERMEDIATE,
+        },
+        True,
+    ),
+    (
+        "hy_v3",
+        {
+            "_config_cls": HyV3Config,
+            "num_hidden_layers": 2,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "first_k_dense_replace": 1,
+            "attn_qk_norm": True,
+            "attn_qk_norm_full": False,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "use_expert_bias": True,
+            "norm_topk_prob": True,
+            "routing_weight_normalization_floor": None,
+            "routing_weight_normalization_epsilon": 1e-20,
+            "routed_scaling_factor": 2.826,
+            "disable_qmoe": True,
+        },
+        True,
+    ),
+    (
+        "minimax",
+        {
+            "_config_cls": MiniMaxConfig,
+            "layer_types": ["full_attention", "lightning_attention"],
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "head_dim": TINY_HIDDEN // TINY_HEADS,
+        },
+        True,
+    ),
+    (
+        "kimi_k3",
+        {
+            "_config_cls": KimiK3Config,
+            "num_hidden_layers": 2,
+            "layer_types": ["kimi_k3_attention", "full_attention"],
+            "linear_num_key_heads": TINY_HEADS,
+            "linear_num_value_heads": TINY_HEADS,
+            "linear_key_head_dim": TINY_HEAD_DIM,
+            "linear_value_head_dim": TINY_HEAD_DIM,
+            "linear_conv_kernel_dim": 4,
+            "linear_gate_lower_bound": 5.0,
+            "linear_use_full_rank_gate": True,
+            "q_lora_rank": 16,
+            "qk_nope_head_dim": 8,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 8,
+            "kv_lora_rank": 16,
+            "mla_use_output_gate": True,
+            "attn_res_block_size": 1,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 16,
+            "routed_expert_hidden_size": 32,
+            "latent_moe_use_norm": True,
+            "n_shared_experts": 2,
+            "first_k_dense_replace": 1,
+            "norm_topk_prob": True,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "activation_situ_beta": 4.0,
+            "activation_situ_linear_beta": 25.0,
+            "disable_qmoe": True,
+            "tie_word_embeddings": False,
+            "rope_type": None,
+        },
+        True,
+    ),
+    (
+        "kimi_linear",
+        {
+            "_config_cls": KimiLinearConfig,
+            "num_hidden_layers": 2,
+            "layer_types": ["kimi_linear_attention", "full_attention"],
+            "linear_num_key_heads": TINY_HEADS,
+            "linear_num_value_heads": TINY_HEADS,
+            "linear_key_head_dim": TINY_HEAD_DIM,
+            "linear_value_head_dim": TINY_HEAD_DIM,
+            "linear_conv_kernel_dim": 4,
+            "qk_nope_head_dim": 8,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 8,
+            "kv_lora_rank": 16,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 16,
+            "n_shared_experts": 1,
+            "first_k_dense_replace": 1,
+            "norm_topk_prob": True,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "disable_qmoe": True,
+            "rope_type": None,
+        },
+        True,
+    ),
+    (
+        "MiniMaxText01",
+        {
+            "_config_cls": MiniMaxConfig,
+            "layer_types": ["full_attention", "lightning_attention"],
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "head_dim": TINY_HIDDEN // TINY_HEADS,
+        },
+        False,
+    ),
+    (
+        "minimax_text_01",
+        {
+            "_config_cls": MiniMaxConfig,
+            "layer_types": ["full_attention", "lightning_attention"],
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "head_dim": TINY_HIDDEN // TINY_HEADS,
+        },
+        False,
+    ),
+    (
+        "gpt_oss",
+        {
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 64,
+            "head_dim": TINY_HEAD_DIM,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+        },
+        True,
+    ),
+    # --- Variant coverage: architecture code-path variants ---
+    # qwen3_next: mostly full-attention (1 linear + 1 full) — exercises full-attention path
+    # while satisfying HF Qwen3NextDynamicCache's requirement for at least one linear layer.
+    (
+        "qwen3_next",
+        {
+            "hidden_act": "silu",
+            "layer_types": ["full_attention", "linear_attention"],
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "norm_topk_prob": True,
+            "attn_qk_norm": True,
+            "partial_rotary_factor": 0.25,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+        },
+        False,
+    ),
+    # qwen3_next: mostly linear-attention (1 linear + 1 full) — exercises DeltaNet path
+    # while satisfying HF Qwen3NextDynamicCache's requirement for at least one full-attn layer.
+    (
+        "qwen3_next",
+        {
+            "hidden_act": "silu",
+            "layer_types": ["linear_attention", "full_attention"],
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "norm_topk_prob": True,
+            "attn_qk_norm": True,
+            "partial_rotary_factor": 0.25,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+        },
+        False,
+    ),
+    # deepseek_v2: MLA with dense MLP (no MoE, all layers dense)
+    (
+        "deepseek_v2",
+        {
+            # MLA: kv heads must equal attn heads (see MLA note near top of file).
+            "num_key_value_heads": TINY_HEADS,
+            "q_lora_rank": 32,
+            "kv_lora_rank": 16,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "num_local_experts": 0,
+            "num_experts_per_tok": 0,
+            "moe_intermediate_size": 32,
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 1.0,
+            "scoring_func": "softmax",
+            "topk_method": "greedy",
+            "first_k_dense_replace": TINY_LAYERS,
+            "n_shared_experts": 0,
+        },
+        False,
+    ),
+    # jamba: hybrid Mamba+Attention with MoE (requires JambaConfig)
+    (
+        "jamba",
+        {
+            "_config_cls": JambaConfig,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "mamba",
+                "full_attention",
+                "mamba",
+                "full_attention",
+            ],
+            "mamba_d_state": 8,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "mamba_dt_rank": 4,
+            "num_local_experts": 2,
+            "num_experts_per_tok": 1,
+        },
+        True,
+    ),
+    # jamba: all attention layers (no Mamba SSM)
+    (
+        "jamba",
+        {
+            "_config_cls": JambaConfig,
+            "layer_types": ["full_attention"] * TINY_LAYERS,
+            "mamba_d_state": 8,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "mamba_dt_rank": 4,
+            "num_local_experts": 2,
+            "num_experts_per_tok": 1,
+            "expert_layer_period": 2,
+            "expert_layer_offset": 1,
+        },
+        False,
+    ),
+    # bamba: hybrid Mamba2+Attention (requires BambaConfig)
+    (
+        "bamba",
+        {
+            "_config_cls": BambaConfig,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "mamba2",
+                "full_attention",
+                "mamba2",
+                "mamba2",
+            ],
+            "mamba_n_heads": 4,
+            "mamba_d_head": 32,
+            "mamba_d_state": 8,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+        },
+        True,
+    ),
+    # falcon_h1: every layer runs Attention and Mamba2 in parallel.
+    (
+        "falcon_h1",
+        {
+            "_config_cls": FalconH1Config,
+            "mamba_d_ssm": TINY_HIDDEN,
+            "mamba_n_heads": TINY_HEADS,
+            "mamba_d_head": TINY_HEAD_DIM,
+            "mamba_d_state": 8,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_chunk_size": 16,
+            "attention_bias": True,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "mlp_bias": True,
+            "mamba_proj_bias": True,
+            "projectors_bias": True,
+            "mamba_rms_norm": True,
+            "mamba_norm_before_gate": True,
+            "time_step_limit": [0.001, 0.1],
+            "attention_in_multiplier": 0.75,
+            "attention_out_multiplier": 1.25,
+            "key_multiplier": 0.5,
+            "ssm_in_multiplier": 0.625,
+            "ssm_out_multiplier": 1.375,
+            "mlp_multipliers": [0.875, 1.125],
+            "ssm_multipliers": [0.5, 0.75, 1.0, 1.25, 1.5],
+        },
+        True,
+    ),
+    (
+        "plamo2",
+        {
+            "_config_cls": Plamo2Config,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-6,
+            "attention_head_counts": (0, TINY_HEADS),
+            "attention_kv_head_counts": (0, TINY_KV_HEADS),
+            "mamba_num_heads": 4,
+            "mamba_d_state": 8,
+            "mamba_d_conv": 4,
+            "mamba_dt_rank": 8,
+            "mamba_group_count": 0,
+            "attention_window_size": 128,
+            "use_predefined_initial_state": False,
+            "tie_word_embeddings": True,
+            "attn_qkv_bias": False,
+            "attn_o_bias": False,
+            "mlp_bias": False,
+        },
+        True,
+    ),
+    # bamba: all attention layers (no Mamba2)
+    (
+        "bamba",
+        {
+            "_config_cls": BambaConfig,
+            "layer_types": ["full_attention"] * TINY_LAYERS,
+            "mamba_n_heads": 4,
+            "mamba_d_head": 32,
+            "mamba_d_state": 8,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+        },
+        False,
+    ),
+    # nemotron_h: hybrid Mamba2+Attention (requires NemotronHConfig)
+    (
+        "nemotron_h",
+        {
+            "hidden_act": "relu2",
+            "layer_types": ["mamba2", "mlp", "full_attention", "mamba2"],
+            "_config_cls": NemotronHConfig,
+            "num_hidden_layers": 4,
+            "mamba_n_heads": TINY_KV_HEADS,
+            "mamba_d_head": TINY_HEAD_DIM,
+            "mamba_d_state": 16,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+        },
+        True,
+    ),
+    # Nemotron-H latent MoE: gate/shared expert use hidden states while routed
+    # experts operate in the projected latent space.
+    (
+        "nemotron_h",
+        {
+            "hidden_act": "relu2",
+            "layer_types": ["mamba2", "moe", "full_attention", "moe"],
+            "_config_cls": NemotronHConfig,
+            "num_hidden_layers": 4,
+            "mamba_n_heads": TINY_KV_HEADS,
+            "mamba_d_head": TINY_HEAD_DIM,
+            "mamba_d_state": 16,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": TINY_INTERMEDIATE,
+            "moe_latent_size": TINY_HIDDEN // 2,
+            "shared_expert_intermediate_size": TINY_INTERMEDIATE * 2,
+            "norm_topk_prob": True,
+            "routed_scaling_factor": 2.5,
+        },
+        True,
+    ),
+    # nemotron_h MoE variant: hybrid Mamba2+MoE+Attention (Nemotron-3 30B/120B)
+    (
+        "nemotron_h",
+        {
+            "hidden_act": "relu2",
+            "layer_types": [
+                "mamba2",
+                "moe",
+                "mamba2",
+                "moe",
+                "full_attention",
+                "moe",
+            ],
+            "_config_cls": NemotronHConfig,
+            "num_hidden_layers": 6,
+            "mamba_n_heads": TINY_KV_HEADS,
+            "mamba_d_head": TINY_HEAD_DIM,
+            "mamba_d_state": 16,
+            "mamba_n_groups": 1,
+            "mamba_d_conv": 4,
+            "mamba_expand": 2,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": TINY_INTERMEDIATE,
+            "shared_expert_intermediate_size": TINY_INTERMEDIATE * 2,
+            "norm_topk_prob": True,
+            "routed_scaling_factor": 2.5,
+        },
+        True,
+    ),
+    # gemma3n_text: all full attention (no sliding window) + KV layer sharing.
+    # With num_kv_shared_layers=1 the last layer borrows K,V from layer 0, so
+    # the graph owns TINY_LAYERS - 1 cache entries and layer 1 has no
+    # k_proj/v_proj/k_norm weights.
+    (
+        "gemma3n_text",
+        {
+            "_config_cls": Gemma3nConfig,
+            "attn_qk_norm": True,
+            "hidden_act": "gelu_pytorch_tanh",
+            "rope_local_base_freq": 10_000.0,
+            "layer_types": ["full_attention"] * TINY_LAYERS,
+            "altup_num_inputs": 2,
+            "altup_active_idx": 0,
+            "altup_correct_scale": True,
+            "laurel_rank": 16,
+            "hidden_size_per_layer_input": 32,
+            "vocab_size_per_layer_input": 256,
+            "num_kv_shared_layers": 1,
+        },
+        False,
+    ),
+    # gemma3n_text: mixed layer types *together with* KV sharing, which is what
+    # the real E4B checkpoint has (35 layers, num_kv_shared_layers=15) and which
+    # neither entry above reaches -- one has mixed types with sharing off, the
+    # other has sharing on but a single layer type. Only this combination
+    # exercises HF's per-type source selection, where a sliding shared layer and
+    # a full-attention shared layer must borrow K,V from *different* source
+    # layers. Getting that wrong still produces a loadable graph with plausible
+    # attention, so a shape-only test would not catch it.
+    #
+    # 4 layers with num_kv_shared_layers=2 gives prev_layers = [sliding, full]:
+    # layer 2 (sliding) borrows from layer 0, layer 3 (full) borrows from layer 1.
+    # Also keeps activation sparsity on for a subset of layers.
+    (
+        "gemma3n_text",
+        {
+            "_config_cls": Gemma3nConfig,
+            "attn_qk_norm": True,
+            "hidden_act": "gelu_pytorch_tanh",
+            "rope_local_base_freq": 10_000.0,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "altup_num_inputs": 2,
+            "altup_active_idx": 0,
+            "altup_correct_scale": True,
+            "laurel_rank": 16,
+            "hidden_size_per_layer_input": 32,
+            "vocab_size_per_layer_input": 256,
+            "num_kv_shared_layers": 2,
+            "activation_sparsity_pattern": [0.95, 0.95, 0.0, 0.0],
+        },
+        False,
+    ),
+    # granite: with non-default scaling multipliers
+    (
+        "granite",
+        {
+            "embedding_multiplier": 12.0,
+            "attention_multiplier": 0.0625,
+            "logits_scaling": 0.125,
+            "residual_multiplier": 0.5,
+        },
+        False,
+    ),
+    (
+        "gguf_plamo",
+        {
+            "hidden_act": "silu",
+            "num_attention_heads": TINY_HEADS,
+            "num_key_value_heads": TINY_KV_HEADS,
+        },
+        True,
+    ),
+    # phi3small: different partial_rotary_factor
+    (
+        "phi3small",
+        {"partial_rotary_factor": 0.25},
+        False,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Encoder-only configs  (task: feature-extraction)
+# ---------------------------------------------------------------------------
+ENCODER_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "gemma_embedding_gguf",
+        {
+            "hidden_act": "gelu_pytorch_tanh",
+            "pooling_type": 0,
+            "sliding_window": 8,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "rope_local_base_freq": 10_000.0,
+        },
+        True,
+    ),
+    (
+        "llama_embed_gguf",
+        {
+            "hidden_act": "silu",
+            "pooling_type": 0,
+        },
+        True,
+    ),
+    ("bert", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
+    ("albert", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
+    (
+        "camembert",
+        {"hidden_act": "gelu", "type_vocab_size": 1},
+        False,
+    ),
+    (
+        "clip_text_model",
+        {"hidden_act": "gelu", "type_vocab_size": 0},
+        True,
+    ),
+    (
+        "data2vec-text",
+        {"hidden_act": "gelu", "type_vocab_size": 1},
+        False,
+    ),
+    ("deberta", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
+    (
+        "deberta-v2",
+        {"hidden_act": "gelu", "type_vocab_size": 2},
+        True,
+    ),
+    (
+        "distilbert",
+        {
+            "hidden_act": "gelu",
+            "type_vocab_size": 0,
+            "max_position_embeddings": 64,
+        },
+        True,
+    ),
+    ("electra", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    ("ernie", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    ("ernie_m", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    (
+        "esm",
+        {
+            "_config_cls": EsmConfig,
+            "hidden_act": "gelu",
+            "type_vocab_size": 2,
+            # ESM-2 rotates the whole head dimension with base 10000 and
+            # declares it through ``position_embedding_type`` alone.
+            "partial_rotary_factor": 1.0,
+        },
+        False,
+    ),
+    ("flaubert", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    ("ibert", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    (
+        "megatron-bert",
+        {"hidden_act": "gelu", "type_vocab_size": 2},
+        False,
+    ),
+    (
+        "mobilebert",
+        {"hidden_act": "gelu", "type_vocab_size": 2},
+        False,
+    ),
+    ("nezha", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    ("qdqbert", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    ("rembert", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    (
+        "roberta",
+        {"hidden_act": "gelu", "type_vocab_size": 1},
+        False,
+    ),
+    (
+        "roberta-prelayernorm",
+        {"hidden_act": "gelu", "type_vocab_size": 1},
+        False,
+    ),
+    ("roc_bert", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    ("roformer", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
+    (
+        "splinter",
+        {"hidden_act": "gelu", "type_vocab_size": 2},
+        False,
+    ),
+    (
+        "squeezebert",
+        {"hidden_act": "gelu", "type_vocab_size": 2},
+        False,
+    ),
+    (
+        "xlm-roberta",
+        {"hidden_act": "gelu", "type_vocab_size": 1},
+        False,
+    ),
+    (
+        "xlm-roberta-xl",
+        {"hidden_act": "gelu", "type_vocab_size": 1},
+        False,
+    ),
+    ("xlnet", {"hidden_act": "gelu", "type_vocab_size": 2}, True),
+    ("xmod", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    ("bros", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    ("layoutlm", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    (
+        "layoutlmv2",
+        {"hidden_act": "gelu", "type_vocab_size": 2},
+        False,
+    ),
+    (
+        "layoutlmv3",
+        {"hidden_act": "gelu", "type_vocab_size": 2},
+        False,
+    ),
+    ("modernbert", {"hidden_act": "gelu"}, True),
+    (
+        "eurobert_gguf",
+        {"hidden_act": "silu", "rope_type": "default"},
+        True,
+    ),
+    (
+        "neo_bert_gguf",
+        {"hidden_act": "silu", "rope_type": "default"},
+        True,
+    ),
+    (
+        "nomic_bert_gguf",
+        {
+            "hidden_act": "silu",
+            "rope_type": "default",
+            "type_vocab_size": 2,
+            "encoder_use_token_type_embeddings": True,
+        },
+        True,
+    ),
+    (
+        "nomic_bert_moe_gguf",
+        {
+            "hidden_act": "gelu_pytorch_tanh",
+            "rope_type": "default",
+            "type_vocab_size": 1,
+            "encoder_use_token_type_embeddings": True,
+            "encoder_q_bias": True,
+            "attn_o_bias": True,
+            "encoder_ffn_up_bias": True,
+            "encoder_ffn_down_bias": True,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_layer_frequency": 2,
+            "norm_topk_prob": False,
+        },
+        True,
+    ),
+    (
+        "jina_bert_v2_gguf",
+        {
+            "hidden_act": "gelu",
+            "rope_type": None,
+            "type_vocab_size": 2,
+            "encoder_use_token_type_embeddings": True,
+            "encoder_q_bias": True,
+            "encoder_k_bias": True,
+            "encoder_v_bias": True,
+            "attn_o_bias": True,
+            "encoder_ffn_up_bias": True,
+            "encoder_ffn_down_bias": True,
+            "encoder_fused_geglu": True,
+        },
+        True,
+    ),
+    (
+        "jina_bert_v3_gguf",
+        {
+            "hidden_act": "gelu_pytorch_tanh",
+            "rope_type": "default",
+            "type_vocab_size": 1,
+            "encoder_use_token_type_embeddings": True,
+            "encoder_fused_qkv": True,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "encoder_ffn_up_bias": True,
+            "encoder_ffn_down_bias": True,
+        },
+        True,
+    ),
+    ("lilt", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    ("markuplm", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    ("mega", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    ("mra", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    (
+        "nystromformer",
+        {"hidden_act": "gelu", "type_vocab_size": 2},
+        False,
+    ),
+    ("yoso", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+    # === Additional encoder aliases ===
+    ("mpnet", {"hidden_act": "gelu", "type_vocab_size": 2}, False),
+]
+
+
+# ---------------------------------------------------------------------------
+# Seq2Seq (encoder-decoder) configs  (task: seq2seq)
+# ---------------------------------------------------------------------------
+SEQ2SEQ_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "bart",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        True,
+    ),
+    (
+        "bigbird_pegasus",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        True,
+    ),
+    (
+        "blenderbot",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "blenderbot-small",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "fsmt",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "led",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "longt5",
+        {"hidden_act": "relu", "num_decoder_layers": 2},
+        True,
+    ),
+    (
+        "m2m_100",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "marian",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "mbart",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "mt5",
+        {"hidden_act": "gelu_new", "num_decoder_layers": 2, "is_gated_act": True},
+        True,
+    ),
+    (
+        "nllb_moe",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        True,
+    ),
+    (
+        "pegasus",
+        {
+            "hidden_act": "relu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "pegasus_x",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "plbart",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "prophetnet",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "t5",
+        {"hidden_act": "relu", "num_decoder_layers": 2},
+        True,
+    ),
+    (
+        "switch_transformers",
+        {"hidden_act": "relu", "num_decoder_layers": 2},
+        True,
+    ),
+    (
+        "trocr",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "xlm-prophetnet",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    # === Additional seq2seq aliases ===
+    (
+        "mvp",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "nllb-moe",
+        {
+            "hidden_act": "gelu",
+            "num_decoder_layers": 2,
+            "max_position_embeddings": 64,
+        },
+        False,
+    ),
+    (
+        "umt5",
+        {"hidden_act": "gelu_new", "num_decoder_layers": 2, "is_gated_act": True},
+        False,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Vision (image classification / feature extraction) configs
+# ---------------------------------------------------------------------------
+VISION_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "beit",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        True,
+    ),
+    (
+        "blip",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "clip_vision_model",
+        {
+            "hidden_act": "quick_gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        True,
+    ),
+    (
+        "cvt",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        True,
+    ),
+    (
+        "depth_anything",
+        {
+            "_config_cls": DepthAnythingConfig,
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+            "backbone_out_indices": [1, 2],
+            "neck_hidden_sizes": [16, 32],
+            "reassemble_factors": [2.0, 1.0],
+            "fusion_hidden_size": 16,
+            "head_hidden_size": 8,
+        },
+        True,
+    ),
+    (
+        "data2vec-vision",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "deit",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "dinov2",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        True,
+    ),
+    (
+        "dinov2_with_registers",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "dinov3_vit",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "hiera",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        True,
+    ),
+    (
+        "ijepa",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "mobilevit",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        True,
+    ),
+    (
+        "mobilevitv2",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "pvt",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        True,
+    ),
+    (
+        "pvt_v2",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "siglip_vision_model",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        True,
+    ),
+    (
+        "siglip",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "siglip2_vision_model",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "siglip2",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "swin",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        True,
+    ),
+    (
+        "swin2sr",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "swinv2",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "vit",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        True,
+    ),
+    (
+        "vit_hybrid",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "vit_mae",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "vit_msn",
+        {
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+        },
+        False,
+    ),
+    (
+        "sam2",
+        {
+            "_config_cls": Sam2Config,
+            "hidden_act": "gelu",
+            "image_size": 64,
+            "num_channels": 3,
+            "sam2_embed_dims": [16, 32, 64, 128],
+            "sam2_blocks_per_stage": [1, 1, 2, 1],
+            "sam2_num_heads_per_stage": [1, 2, 4, 8],
+            "sam2_mlp_ratio": 4.0,
+            "sam2_fpn_hidden_size": 32,
+        },
+        True,
+    ),
+    (
+        "segformer",
+        {
+            "_config_cls": SegformerConfig,
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "num_channels": 3,
+            "segformer_hidden_sizes": [16, 32],
+            "segformer_num_attention_heads": [1, 2],
+            "segformer_depths": [1, 1],
+            "segformer_sr_ratios": [2, 1],
+            "segformer_mlp_ratios": [4, 4],
+            "segformer_patch_sizes": [3, 3],
+            "segformer_strides": [2, 2],
+            "decoder_hidden_size": 16,
+            "num_labels": 5,
+        },
+        True,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Object detection configs
+# ---------------------------------------------------------------------------
+DETECTION_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "yolos",
+        {
+            "_config_cls": YolosConfig,
+            "hidden_act": "gelu",
+            "image_size": 32,
+            "patch_size": 8,
+            "num_channels": 3,
+            "num_detection_tokens": 10,
+            "num_labels": 5,
+        },
+        True,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# SSM (State Space Model) configs — pure Mamba/Mamba2, no attention
+# ---------------------------------------------------------------------------
+SSM_CONFIGS: list[tuple[str, dict, bool]] = [
+    # mamba: pure Mamba SSM (no attention) — requires MambaConfig
+    (
+        "mamba",
+        {
+            "_config_cls": MambaConfig,
+            "state_size": 8,
+            "conv_kernel": 4,
+            "expand": 2,
+            "time_step_rank": 4,
+        },
+        True,
+    ),
+    # mamba2: pure Mamba2/SSD (no attention) — requires Mamba2Config
+    # intermediate_size must equal num_heads * head_dim for Mamba2.
+    (
+        "mamba2",
+        {
+            "_config_cls": Mamba2Config,
+            "num_heads": 4,
+            "head_dim": 16,
+            "intermediate_size": 64,
+            "state_size": 8,
+            "n_groups": 2,
+            "conv_kernel": 4,
+            "expand": 2,
+        },
+        True,
+    ),
+    # falcon_mamba: Mamba1-based (same as mamba, uses MambaConfig)
+    (
+        "falcon_mamba",
+        {
+            "_config_cls": MambaConfig,
+            "state_size": 8,
+            "conv_kernel": 4,
+            "expand": 2,
+            "time_step_rank": 4,
+        },
+        False,
+    ),
+]
+
+
+# ---------------------------------------------------------------------------
+# Shared VL tiny vision sub-config (SigLIP-style: 28x28, patch 14)
+# ---------------------------------------------------------------------------
+_TINY_VISION = VisionConfig(
+    hidden_size=32,
+    intermediate_size=64,
+    num_hidden_layers=1,
+    num_attention_heads=2,
+    image_size=28,
+    patch_size=14,
+    norm_eps=1e-6,
+)
+
+_TINY_QWEN_VL_VISION = VisionConfig(
+    hidden_size=32,
+    intermediate_size=64,
+    num_hidden_layers=1,
+    num_attention_heads=2,
+    image_size=28,
+    patch_size=14,
+    norm_eps=1e-6,
+    spatial_merge_size=2,
+    temporal_patch_size=2,
+    out_hidden_size=64,
+)
+
+_TINY_QWEN3_VL_VISION = VisionConfig(
+    hidden_size=32,
+    intermediate_size=64,
+    num_hidden_layers=1,
+    num_attention_heads=2,
+    image_size=28,
+    patch_size=14,
+    norm_eps=1e-6,
+    spatial_merge_size=2,
+    temporal_patch_size=2,
+    out_hidden_size=64,
+    fullatt_block_indexes=[0],
+    window_size=4,
+)
+
+_TINY_MINICPMV46_VISION = VisionConfig(
+    hidden_size=32,
+    intermediate_size=64,
+    num_hidden_layers=2,
+    num_attention_heads=2,
+    image_size=56,
+    patch_size=14,
+    norm_eps=1e-6,
+    in_channels=3,
+    num_position_embeddings=16,
+    insert_layer_id=0,
+    window_kernel_size=(2, 2),
+    merge_kernel_size=(2, 2),
+    merger_times=1,
+)
+
+
+_TINY_COSMOS3_EDGE_VISION = VisionConfig(
+    hidden_size=32,
+    intermediate_size=64,
+    num_hidden_layers=1,
+    num_attention_heads=2,
+    image_size=28,
+    patch_size=14,
+    norm_eps=1e-6,
+    spatial_merge_size=2,
+    out_hidden_size=64,
+    projector_intermediate_size=64,
+)
+
+_TINY_MUSE_GLIMMER_VISION = VisionConfig(
+    hidden_size=32,
+    intermediate_size=64,
+    num_hidden_layers=4,
+    num_attention_heads=4,
+    head_dim=8,
+    image_size=16,
+    patch_size=2,
+    norm_eps=1e-5,
+    hidden_act="gelu",
+    spatial_merge_size=2,
+    temporal_patch_size=2,
+    position_embedding_height=8,
+    position_embedding_width=8,
+    num_position_embeddings=64,
+    fullatt_block_indexes=[3],
+    window_size=16,
+    projector_intermediate_size=48,
+    out_hidden_size=TINY_HIDDEN,
+)
+
+
+# ---------------------------------------------------------------------------
+# Vision-Language configs  (task: vision-language and variants)
+# ---------------------------------------------------------------------------
+# NOTE: These models build multi-model packages (decoder + vision + embedding).
+# The L1 graph-test parametrization uses specialised test
+# methods that invoke the correct task and assert the right output models.
+VL_CONFIGS: list[tuple[str, dict, bool]] = [
+    (
+        "neo_chat",
+        {
+            "_config_cls": SenseNovaU1Config,
+            "head_dim": 16,
+            "attn_qk_norm": True,
+            "rope_theta": 5e6,
+            "rope_theta_hw": 1e4,
+            "max_position_embeddings_hw": 512,
+            "patch_size": 4,
+            "downsample_ratio": 0.5,
+            "frequency_embedding_size": 8,
+            "vision": VisionConfig(
+                hidden_size=32,
+                patch_size=4,
+                in_channels=3,
+                spatial_merge_size=2,
+                out_hidden_size=TINY_HIDDEN,
+                rope_theta=1e4,
+                num_position_embeddings=512,
+                num_hidden_layers=0,
+                num_attention_heads=0,
+            ),
+        },
+        True,
+    ),
+    # --- Nemotron Parse (C-RADIO + feature neck + cross-attentive decoder) ---
+    (
+        "nemotron_parse",
+        {
+            "_config_cls": NemotronParseConfig,
+            "hidden_act": "gelu",
+            "num_decoder_layers": 1,
+            "num_key_value_heads": TINY_HEADS,
+            "image_height": 32,
+            "image_width": 64,
+            "vision_max_grid_size": 4,
+            "num_summary_tokens": 3,
+            "vision": VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                image_size=64,
+                patch_size=16,
+                norm_eps=1e-6,
+            ),
+        },
+        True,
+    ),
+    # --- LLaVA family (vision-language, 3-model split) ---
+    ("llava", {"vision": _TINY_VISION, "image_token_id": 32000}, True),
+    (
+        "lfm2_vl",
+        {
+            "_config_cls": Lfm2VlConfig,
+            "layer_types": ["conv", "full_attention"],
+            "attn_qk_norm": True,
+            "block_auto_adjust_ff_dim": False,
+            "tie_word_embeddings": True,
+            "image_token_id": 250,
+            "downsample_factor": 2,
+            "projector_hidden_act": "gelu",
+            "projector_hidden_size": TINY_HIDDEN,
+            "projector_bias": True,
+            "projector_use_layernorm": False,
+            "vision": VisionConfig(
+                model_type="siglip2_naflex",
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=16,
+                patch_size=4,
+                norm_eps=1e-6,
+                in_channels=3,
+                num_position_embeddings=16,
+                hidden_act="gelu_pytorch_tanh",
+            ),
+        },
+        True,
+    ),
+    (
+        "muse_glimmer",
+        {
+            **_TINY_MUSE_GLIMMER_TEXT_OVERRIDES,
+            "vision": _TINY_MUSE_GLIMMER_VISION,
+            "image_token_id": 200092,
+            "video_token_id": 200091,
+        },
+        True,
+    ),
+    (
+        "minicpmv4_6",
+        {
+            "vision": _TINY_MINICPMV46_VISION,
+            "image_token_id": 250,
+            "video_token_id": 251,
+            "num_hidden_layers": 4,
+            "layer_types": [
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ],
+            "partial_rotary_factor": 0.25,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_num_value_heads": 2,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+        },
+        True,
+    ),
+    (
+        "cosmos3_edge",
+        {
+            "vision": _TINY_COSMOS3_EDGE_VISION,
+            "image_token_id": 19,
+            "hidden_act": "relu2",
+            "mlp_bias": False,
+            "mrope_section": [24, 20, 20],
+        },
+        True,
+    ),
+    ("aya_vision", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("chameleon", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("cohere2_vision", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("deepseek_vl", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("deepseek_vl_hybrid", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("florence2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("fuyu", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("glm4v", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("glm4v_moe", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("got_ocr2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    (
+        "hunyuan_vl_mot",
+        {
+            "vision": _TINY_VISION,
+            "image_token_id": 32000,
+            "attn_qk_norm": True,
+            "rms_norm_eps": 1e-5,
+        },
+        True,
+    ),
+    ("idefics2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("idefics3", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("instructblip", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("instructblipvideo", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("janus", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("llava_next", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("llava_next_video", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("llava_onevision", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("molmo", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("ovis2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("paligemma", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("pixtral", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("smolvlm", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("video_llava", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("vipllava", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    # --- Microsoft Phi vision-language models ---
+    ("phi3_v", {"vision": _TINY_VISION, "image_token_id": 32044}, True),
+    ("phi4-siglip", {"vision": _TINY_VISION, "image_token_id": -200}, True),
+    # --- InternVL family ---
+    ("internvl_chat", {"vision": _TINY_VISION, "image_token_id": 32000}, True),
+    ("internvl2", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    ("internvl", {"vision": _TINY_VISION, "image_token_id": 32000}, False),
+    (
+        "mage_vl",
+        {
+            "attn_qk_norm": True,
+            "image_token_id": 100,
+            "video_token_id": 101,
+            "vision_start_token_id": 102,
+            "vision_end_token_id": 103,
+            "vision": VisionConfig(
+                model_type="mage_vl_vision",
+                hidden_size=64,
+                intermediate_size=128,
+                num_hidden_layers=2,
+                num_attention_heads=2,
+                image_size=8,
+                patch_size=4,
+                norm_eps=1e-6,
+                in_channels=3,
+                out_hidden_size=TINY_HIDDEN,
+                spatial_merge_size=2,
+                temporal_patch_size=1,
+                frame_windows_size=4,
+                rope_theta=10_000.0,
+                hidden_act="gelu",
+            ),
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 1,
+            "frame_windows_size": 4,
+        },
+        True,
+    ),
+    # --- Gemma3 multimodal (requires rope_local_base_freq, layer_types) ---
+    (
+        "gemma3",
+        {
+            "attn_qk_norm": True,
+            "rope_local_base_freq": 10_000.0,
+            "layer_types": ["full_attention", "sliding_attention"],
+            "vision": VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+                mm_tokens_per_image=4,
+            ),
+            "mm_tokens_per_image": 4,
+            "image_token_id": 255999,
+        },
+        True,
+    ),
+    # --- Gemma4 multimodal (3-model split: decoder + vision + embedding) ---
+    (
+        "gemma4",
+        {
+            "_config_cls": Gemma4Config,
+            "attn_qk_norm": True,
+            "rope_local_base_freq": 10_000.0,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+            "global_head_dim": TINY_HEAD_DIM,
+            "global_rope_theta": 10_000.0,
+            "global_partial_rotary_factor": 0.25,
+            "final_logit_softcapping": 30.0,
+            "vision": VisionConfig(
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-6,
+                mm_tokens_per_image=4,
+            ),
+            "mm_tokens_per_image": 4,
+            "image_token_id": 255999,
+        },
+        False,
+    ),
+    # --- Gemma3n multimodal (4-model split: decoder + vision + audio + embedding) ---
+    # The MobileNet-V5 tower's 84-block spec and MSFA channel widths are
+    # hard-coded from ``mobilenetv5_300m_enc`` (there is no config source for
+    # them), so only ``hidden_size`` and ``image_size`` shrink here — the tower
+    # still builds all 548 tensors.  ``image_size`` must satisfy
+    # ``size % 32 == 0`` and ``(size // 16) % 16 == 0``, making 256 the
+    # smallest legal value; the tower always emits a 16x16 grid, hence
+    # ``vision_soft_tokens_per_image=256``.
+    (
+        "gemma3n",
+        {
+            "_config_cls": Gemma3nMultiModalConfig,
+            "attn_qk_norm": True,
+            "hidden_act": "gelu_pytorch_tanh",
+            "rope_local_base_freq": 10_000.0,
+            "layer_types": ["full_attention", "sliding_attention"],
+            "altup_num_inputs": 2,
+            "altup_active_idx": 0,
+            "altup_correct_scale": True,
+            "laurel_rank": 16,
+            "hidden_size_per_layer_input": 32,
+            "vocab_size_per_layer_input": 256,
+            # Mixed layer_types with TINY_LAYERS=2 leaves no same-type source
+            # layer to borrow K,V from; sharing is covered by gemma3n_text.
+            "num_kv_shared_layers": 0,
+            # Layer 0 sparse, layer 1 dense: covers both branches of the
+            # activation-sparsity fork in Gemma3nMLP.
+            "activation_sparsity_pattern": [0.95, 0.0],
+            # Reserved-id layout mirrors E4B: the vision soft-token range is
+            # immediately followed by the audio one, and each modality's
+            # placeholder token sits just past its own range.
+            "image_token_id": 216,
+            "audio_token_id": 217,
+            "vision_soft_tokens_per_image": 256,
+            "audio_soft_tokens_per_image": 8,
+            "vision": VisionConfig(
+                hidden_size=32,
+                image_size=256,
+                norm_eps=1e-6,
+                rms_norm_eps=1e-6,
+                vocab_offset=200,
+                vocab_size=8,
+                architecture="mobilenetv5_300m_enc",
+                do_pooling=False,
+            ),
+            "audio": Gemma3nAudioConfig(
+                hidden_size=32,
+                conf_num_attention_heads=4,
+                conf_num_hidden_layers=1,
+                conf_attention_chunk_size=4,
+                conf_attention_context_left=5,
+                conf_attention_context_right=0,
+                conf_reduction_factor=2,
+                input_feat_size=16,
+                sscp_conv_channel_size=[8, 4],
+                vocab_offset=208,
+                vocab_size=8,
+            ),
+        },
+        True,
+    ),
+    # --- Gemma4 Any-to-Any (4-model split: decoder + vision + speech + embedding) ---
+    # Tested directly in test_gemma4_any_to_any_graph; omitted from parametrized suite
+    # because it uses the unified "gemma4" registry key, same as the VL-only config above.
+    # --- Gemma4 unified gemma-4-12B (encoder-free 3-model split here; the 4-model
+    # audio path is exercised by test_gemma4_unified_multimodal_graph) ---
+    (
+        "gemma4_unified",
+        {
+            "_config_cls": Gemma4Config,
+            "hidden_act": "gelu_pytorch_tanh",
+            "attn_qk_norm": True,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 8,
+            "global_head_dim": 2 * TINY_HEAD_DIM,
+            "global_rope_theta": 1_000_000.0,
+            "global_partial_rotary_factor": 0.25,
+            "final_logit_softcapping": 30.0,
+            "hidden_size_per_layer_input": 0,
+            "num_global_key_value_heads": 1,
+            "attention_k_eq_v": True,
+            "use_bidirectional_attention": "vision",
+            "image_token_id": 255999,
+            "tie_word_embeddings": True,
+            # Encoder-free vision embedder (raw patches → pooled image features).
+            "vision": VisionConfig(
+                hidden_size=48,
+                patch_size=4,
+                pooling_kernel_size=2,
+                position_embedding_size=64,
+                out_hidden_size=48,
+                norm_eps=1e-6,
+            ),
+        },
+        False,
+    ),
+    # --- Blip2 (ViT + Q-Former + LLM) ---
+    (
+        "blip-2",
+        {
+            "vision": _TINY_VISION,
+            "image_token_id": 50265,
+            "num_query_tokens": 4,
+            "qformer_hidden_size": 32,
+            "qformer_num_hidden_layers": 1,
+            "qformer_num_attention_heads": 2,
+            "qformer_intermediate_size": 64,
+        },
+        True,
+    ),
+    # --- DeepSeek-VL-V2 (SAM ViT + Qwen2 encoder + MoE decoder) ---
+    (
+        "deepseek_vl_v2",
+        {
+            "vision": _TINY_VISION,
+            "image_token_id": 32000,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64,
+            "moe_layer_frequency": 1,
+            "first_k_dense_replace": 0,
+            "n_shared_experts": 1,
+        },
+        True,
+    ),
+    # --- Mllama (cross-attention VL, requires MllamaConfig) ---
+    (
+        "mllama",
+        {
+            "_config_cls": MllamaConfig,
+            "num_hidden_layers": 3,
+            "vision": _TINY_VISION,
+            "image_token_id": 32000,
+            "cross_attention_layers": [1],
+        },
+        True,
+    ),
+    # --- Qwen VL family (packed-attention, MRoPE) ---
+    (
+        "qwen2_vl",
+        {
+            "vision": _TINY_QWEN_VL_VISION,
+            "image_token_id": 32000,
+            "temporal_patch_size": 2,
+            "mrope_section": [16, 24, 24],
+        },
+        True,
+    ),
+    (
+        "qwen2_5_vl",
+        {
+            "vision": _TINY_QWEN_VL_VISION,
+            "image_token_id": 32000,
+            "temporal_patch_size": 2,
+            "mrope_section": [16, 24, 24],
+        },
+        False,
+    ),
+    (
+        "glm_ocr",
+        {
+            "attn_qkv_bias": False,
+            "mrope_section": [2, 3, 3],
+            "vision": VisionConfig(
+                model_type="glm_ocr_vision",
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                image_size=28,
+                patch_size=14,
+                norm_eps=1e-5,
+                in_channels=3,
+                out_hidden_size=TINY_HIDDEN,
+                spatial_merge_size=2,
+                temporal_patch_size=2,
+                hidden_act="silu",
+            ),
+            "image_token_id": 59280,
+            "vision_start_token_id": 59256,
+            "vision_end_token_id": 59257,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+        },
+        True,
+    ),
+    (
+        "qwen3_vl",
+        {
+            "vision": _TINY_QWEN3_VL_VISION,
+            "image_token_id": 32000,
+            "temporal_patch_size": 2,
+            "mrope_section": [16, 24, 24],
+            "attn_qk_norm": True,
+            "deepstack_visual_indexes": [0],
+        },
+        True,
+    ),
+    # Cosmos3-Omni understanding tower ("Reasoner"): architecturally identical
+    # to Qwen3-VL (nvidia/Cosmos3-Nano/Super).  Interleaved 3D M-RoPE, QK-norm.
+    (
+        "cosmos3_omni",
+        {
+            "vision": _TINY_QWEN3_VL_VISION,
+            "image_token_id": 32000,
+            "temporal_patch_size": 2,
+            "mrope_section": [16, 24, 24],
+            "mrope_interleaved": True,
+            "attn_qk_norm": True,
+            "deepstack_visual_indexes": [0],
+        },
+        True,
+    ),
+    (
+        "qwen3_vl_single",
+        {
+            "vision": _TINY_QWEN3_VL_VISION,
+            "image_token_id": 32000,
+            "temporal_patch_size": 2,
+            "mrope_section": [16, 24, 24],
+            "attn_qk_norm": True,
+        },
+        False,
+    ),
+    (
+        "qwen3_5_vl",
+        {
+            "vision": _TINY_QWEN3_VL_VISION,
+            "image_token_id": 32000,
+            "temporal_patch_size": 2,
+            "mrope_section": [16, 24, 24],
+            "attn_qk_norm": True,
+            "deepstack_visual_indexes": [0],
+        },
+        True,
+    ),
+    # qwen3_5: alias for qwen3_5_vl (same module: Qwen35VL3ModelCausalLMModel)
+    (
+        "qwen3_5",
+        {
+            "vision": _TINY_QWEN3_VL_VISION,
+            "image_token_id": 32000,
+            "temporal_patch_size": 2,
+            "mrope_section": [16, 24, 24],
+            "attn_qk_norm": True,
+            "deepstack_visual_indexes": [0],
+        },
+        False,
+    ),
+    # qwen3_5_moe_vl: Qwen3.6-35B-A3B family. Hybrid linear/full attention
+    # MoE text backbone + Qwen3VL ViT, exported as a 3-model split.
+    (
+        "qwen3_5_moe_vl",
+        {
+            "hidden_act": "silu",
+            "layer_types": ["linear_attention", "full_attention"],
+            "partial_rotary_factor": 0.25,
+            "mrope_interleaved": True,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "vision": _TINY_QWEN3_VL_VISION,
+            "image_token_id": 32000,
+            "temporal_patch_size": 2,
+            "mrope_section": [16, 24, 24],
+            "attn_qk_norm": True,
+            "deepstack_visual_indexes": [0],
+        },
+        True,
+    ),
+    (
+        "qwen4_exp",
+        {
+            **_TINY_QWEN4_EXP_OVERRIDES,
+            "model_type": "qwen4_exp",
+            "vision": VisionConfig(
+                model_type="qwen4_exp_vision",
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=16_777_216,
+                patch_size=16,
+                norm_eps=1e-6,
+                in_channels=3,
+                out_hidden_size=TINY_HIDDEN,
+                spatial_merge_size=2,
+                temporal_patch_size=2,
+                num_position_embeddings=16,
+                hidden_act="gelu_pytorch_tanh",
+                deepstack_visual_indexes=[],
+            ),
+            "image_token_id": 248056,
+            "video_token_id": None,
+            "unsupported_video_token_id": 248057,
+            "vision_start_token_id": 248053,
+            "vision_end_token_id": 248054,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+            "mrope_section": [2, 3, 3],
+            "mrope_interleaved": True,
+            "deepstack_visual_indexes": [],
+        },
+        True,
+    ),
+    (
+        "Qwen4ExpForConditionalGeneration",
+        {
+            **_TINY_QWEN4_EXP_OVERRIDES,
+            "model_type": "qwen4_exp",
+            "vision": VisionConfig(
+                model_type="qwen4_exp_vision",
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                image_size=16_777_216,
+                patch_size=16,
+                norm_eps=1e-6,
+                in_channels=3,
+                out_hidden_size=TINY_HIDDEN,
+                spatial_merge_size=2,
+                temporal_patch_size=2,
+                num_position_embeddings=16,
+                hidden_act="gelu_pytorch_tanh",
+                deepstack_visual_indexes=[],
+            ),
+            "image_token_id": 248056,
+            "video_token_id": None,
+            "unsupported_video_token_id": 248057,
+            "vision_start_token_id": 248053,
+            "vision_end_token_id": 248054,
+            "temporal_patch_size": 2,
+            "spatial_merge_size": 2,
+            "mrope_section": [2, 3, 3],
+            "mrope_interleaved": True,
+            "deepstack_visual_indexes": [],
+        },
+        False,
+    ),
+    # mistral3: Pixtral-VL model (same task as pixtral)
+    (
+        "mistral3",
+        {"vision": _TINY_VISION, "image_token_id": 32000},
+        False,
+    ),
+]
+
+
+def vl_overrides(model_type: str) -> dict:
+    """Return a *copy* of a ``VL_CONFIGS`` entry's overrides.
+
+    Lets a dedicated test build the same tiny config the parametrized suite
+    uses (and mutate it for a variant) without the two drifting apart.  The
+    copy is shallow: sub-configs such as :class:`VisionConfig` are shared, so
+    replace them wholesale rather than mutating them in place.
+    """
+    for mt, overrides, _rep in VL_CONFIGS:
+        if mt == model_type:
+            return dict(overrides)
+    raise KeyError(f"No VL_CONFIGS entry for model_type {model_type!r}")
+
+
+# ---------------------------------------------------------------------------
+# Speech / TTS / Codec configs
+# ---------------------------------------------------------------------------
+SPEECH_CONFIGS: list[tuple[str, dict, bool]] = [
+    # --- Parakeet CTC (feature-input offline FastConformer) ---
+    (
+        "parakeet_ctc",
+        {
+            "_config_cls": ParakeetCTCConfig,
+            "num_mel_bins": 16,
+            "subsampling_conv_channels": 8,
+            "conv_kernel_size": 5,
+            "attention_bias": True,
+            "convolution_bias": True,
+            "scale_input": True,
+        },
+        True,
+    ),
+    # --- Nemotron 3 Diarization (bidirectional full-RoPE Sortformer head) ---
+    (
+        "nemotron3_diarization",
+        {
+            "_config_cls": Nemotron3DiarizationConfig,
+            "feat_in": 16,
+            "subsampling_factor": 2,
+            "head_hidden_size": 8,
+            "num_speakers": 4,
+            "partial_rotary_factor": 1.0,
+            # HuggingFace's Nemotron3Diarization audio encoder is always MHA
+            # (checkpoint's audio_config sets num_key_value_heads ==
+            # num_attention_heads); the shared tiny-config default is GQA
+            # (num_key_value_heads=TINY_KV_HEADS < TINY_HEADS), which builds a
+            # V-projection shape no real checkpoint could ever populate.
+            "num_key_value_heads": TINY_HEADS,
+        },
+        True,
+    ),
+    # --- Moonshine (raw-waveform RoPE encoder-decoder ASR) ---
+    (
+        "moonshine",
+        {
+            "_config_cls": MoonshineConfig,
+            "num_key_value_heads": TINY_HEADS,
+            "partial_rotary_factor": 0.75,
+            "rope_type": "default",
+            "rope_interleave": True,
+            "encoder_num_hidden_layers": TINY_LAYERS,
+            "encoder_num_attention_heads": TINY_HEADS,
+            "encoder_num_key_value_heads": TINY_HEADS,
+        },
+        True,
+    ),
+    # --- Moonshine Streaming (causal framing front end + windowed encoder) ---
+    (
+        "moonshine_streaming",
+        {
+            "_config_cls": MoonshineStreamingConfig,
+            "num_key_value_heads": TINY_HEADS,
+            "partial_rotary_factor": 0.8,
+            "rope_type": "default",
+            "rope_interleave": True,
+            "mlp_bias": True,
+            "tie_word_embeddings": False,
+            "encoder_num_hidden_layers": TINY_LAYERS,
+            "encoder_num_attention_heads": TINY_HEADS,
+            "encoder_num_key_value_heads": TINY_HEADS,
+            # Asymmetric lookahead on layer 0, fully causal on layer 1.
+            "encoder_sliding_windows": ((16, 4), (16, 0)),
+        },
+        True,
+    ),
+    # --- Whisper (speech-to-text, encoder-decoder) ---
+    (
+        "whisper",
+        {
+            "_config_cls": WhisperConfig,
+            "attn_qkv_bias": True,
+            "attn_o_bias": True,
+            "tie_word_embeddings": True,
+            "encoder_layers": TINY_LAYERS,
+            "encoder_attention_heads": TINY_HEADS,
+            "encoder_ffn_dim": TINY_INTERMEDIATE,
+            "num_mel_bins": 16,
+            "max_source_positions": 100,
+            "max_target_positions": 50,
+            "scale_embedding": True,
+        },
+        True,
+    ),
+    # --- GLM-ASR-Nano (speech-language, partial-RoPE audio encoder) ---
+    (
+        "glmasr",
+        {
+            "_config_cls": GlmAsrConfig,
+            "audio_token_id": 100,
+            "audio": AudioConfig(
+                d_model=64,
+                encoder_layers=2,
+                encoder_attention_heads=4,
+                encoder_ffn_dim=256,
+                encoder_head_dim=16,
+                encoder_num_key_value_heads=4,
+                encoder_partial_rotary_factor=0.5,
+                encoder_rope_theta=10_000.0,
+                encoder_layer_norm_eps=1e-5,
+                num_mel_bins=128,
+                max_source_positions=256,
+                output_dim=64,
+                activation_function="gelu",
+                audio_token_id=100,
+            ),
+        },
+        True,
+    ),
+    # --- Qwen3-ASR (speech-language, 3-model split) ---
+    (
+        "qwen3_asr",
+        {
+            "attn_qk_norm": True,
+            "mrope_section": [24, 20, 20],
+            "mrope_interleaved": True,
+            "audio": AudioConfig(
+                d_model=64,
+                encoder_layers=2,
+                encoder_attention_heads=4,
+                encoder_ffn_dim=128,
+                num_mel_bins=128,
+                max_source_positions=256,
+                downsample_hidden_size=32,
+                output_dim=64,
+                audio_token_id=100,
+            ),
+        },
+        True,
+    ),
+    # --- Qwen3-ForcedAligner (speech-language, same class as ASR) ---
+    (
+        "qwen3_forced_aligner",
+        {
+            "attn_qk_norm": True,
+            "mrope_section": [24, 20, 20],
+            "mrope_interleaved": True,
+            "audio": AudioConfig(
+                d_model=64,
+                encoder_layers=2,
+                encoder_attention_heads=4,
+                encoder_ffn_dim=128,
+                num_mel_bins=128,
+                max_source_positions=256,
+                downsample_hidden_size=32,
+                output_dim=64,
+                audio_token_id=100,
+                classify_num=10,
+            ),
+        },
+        False,
+    ),
+    # --- Fun-ASR-Nano (speech-language, 3-model split with SANM encoder) ---
+    (
+        "fun_asr",
+        {
+            "attn_qk_norm": True,
+            "rope_type": "default",
+            "audio": AudioConfig(
+                input_size=32,
+                attention_dim=64,
+                attention_heads=4,
+                num_blocks=3,
+                linear_units=128,
+                kernel_size=5,
+                tp_num_blocks=2,
+                output_dim=64,
+                audio_token_id=100,
+                adaptor_proj_dim=128,
+                adaptor_num_blocks=2,
+                adaptor_ffn_dim=32,
+                adaptor_num_heads=4,
+            ),
+        },
+        True,
+    ),
+    # --- VibeVoice continuous-token TTS (8-model split) ---
+    (
+        "vibevoice",
+        {
+            "_config_cls": VibeVoiceConfig,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": 64,
+            "max_position_embeddings": 128,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu",
+            "attn_qkv_bias": True,
+            "rope_type": "default",
+            "audio_token_id": 60,
+            "audio_bos_token_id": 61,
+            "audio_eos_token_id": 62,
+            "acoustic_tokenizer": VibeVoiceTokenizerConfig(
+                hidden_size=4,
+                kernel_size=3,
+                num_filters=4,
+                downsampling_ratios=[2, 2],
+                depths=[1, 1, 1],
+                ffn_expansion=2,
+            ),
+            "semantic_tokenizer": VibeVoiceTokenizerConfig(
+                hidden_size=6,
+                kernel_size=3,
+                num_filters=4,
+                downsampling_ratios=[2, 2],
+                depths=[1, 1, 1],
+                ffn_expansion=2,
+            ),
+            "diffusion_head": VibeVoiceDiffusionConfig(
+                hidden_size=16,
+                intermediate_size=32,
+                latent_size=4,
+                num_hidden_layers=1,
+                frequency_embedding_size=8,
+            ),
+        },
+        True,
+    ),
+    # --- VibeVoice Realtime (split lower/upper Qwen2 TTS backbones) ---
+    (
+        "vibevoice_streaming",
+        {
+            "_config_cls": VibeVoiceStreamingConfig,
+            "num_hidden_layers": 3,
+            "tts_backbone_num_hidden_layers": 2,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": 64,
+            "max_position_embeddings": 128,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu",
+            "attn_qkv_bias": True,
+            "rope_type": "default",
+            "acoustic_tokenizer": VibeVoiceStreamingTokenizerConfig(
+                vae_dim=4,
+                decoder_n_filters=4,
+                decoder_ratios=[2, 2],
+                encoder_depths=[1, 1, 1],
+                kernel_size=7,
+                ffn_expansion=4,
+            ),
+            "diffusion_head": VibeVoiceStreamingDiffusionConfig(
+                hidden_size=16,
+                intermediate_size=32,
+                latent_size=4,
+                num_hidden_layers=1,
+                frequency_embedding_size=8,
+            ),
+        },
+        True,
+    ),
+    # --- Original VibeVoice offline ASR (dual cached audio encoders + Qwen2) ---
+    (
+        "vibevoice_asr",
+        {
+            "_config_cls": VibeVoiceASRConfig,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": 64,
+            "max_position_embeddings": 128,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu",
+            "attn_qkv_bias": True,
+            "rope_type": "default",
+            "audio_token_id": 60,
+            "audio_bos_token_id": 61,
+            "audio_eos_token_id": 62,
+            "acoustic_tokenizer": VibeVoiceTokenizerConfig(
+                hidden_size=4,
+                kernel_size=3,
+                num_filters=4,
+                downsampling_ratios=[2, 2],
+                depths=[1, 1, 1],
+                ffn_expansion=2,
+            ),
+            "semantic_tokenizer": VibeVoiceTokenizerConfig(
+                hidden_size=6,
+                kernel_size=3,
+                num_filters=4,
+                downsampling_ratios=[2, 2],
+                depths=[1, 1, 1],
+                ffn_expansion=2,
+            ),
+        },
+        True,
+    ),
+    # --- VibeVoice streaming ASR (three-stage causal tokenizers + Qwen2) ---
+    (
+        "VibeVoiceForASRStreamingTraining",
+        {
+            "_config_cls": VibeVoiceASRStreamingConfig,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": 64,
+            "max_position_embeddings": 128,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu",
+            "attn_qkv_bias": True,
+            "rope_type": "default",
+            "speech_start_token_id": 60,
+            "speech_end_token_id": 61,
+            "speech_placeholder_token_id": 62,
+            "text_chunk_end_token_id": 63,
+            "acoustic_tokenizer": VibeVoiceTokenizerConfig(
+                hidden_size=4,
+                kernel_size=3,
+                num_filters=4,
+                downsampling_ratios=[2, 2],
+                depths=[1, 1, 1],
+                ffn_expansion=2,
+                vae_std=0.5,
+                std_dist_type="gaussian",
+            ),
+            "semantic_tokenizer": VibeVoiceTokenizerConfig(
+                hidden_size=6,
+                kernel_size=3,
+                num_filters=4,
+                downsampling_ratios=[2, 2],
+                depths=[1, 1, 1],
+                ffn_expansion=2,
+                std_dist_type="none",
+            ),
+        },
+        True,
+    ),
+    # --- Qwen3-TTS Codec Tokenizer (codec, 2-model split) ---
+    (
+        "qwen3_tts_tokenizer_12hz",
+        {
+            "codec_decoder": CodecDecoderConfig(
+                codebook_dim=32,
+                codebook_size=64,
+                latent_dim=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                head_dim=8,
+                rms_norm_eps=1e-5,
+                rope_theta=10000.0,
+                max_position_embeddings=128,
+                decoder_dim=96,
+                num_quantizers=4,
+                upsample_rates=[2, 2, 2, 2],
+                upsampling_ratios=[2, 2],
+            ),
+            "codec_encoder": CodecEncoderConfig(
+                codebook_dim=16,
+                codebook_size=64,
+                hidden_size=32,
+                intermediate_size=128,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                head_dim=8,
+                rope_theta=10000.0,
+                max_position_embeddings=128,
+                num_quantizers=8,
+                num_semantic_quantizers=1,
+            ),
+        },
+        True,
+    ),
+    # --- Wav2Vec2-family audio feature extractors (all use Wav2Vec2Model) ---
+    # Default ArchitectureConfig works because Wav2Vec2Model reads
+    # conv_channels/conv_kernel_sizes via getattr with sensible defaults.
+    ("wav2vec2", {}, True),
+    ("hubert", {}, False),
+    ("data2vec-audio", {}, False),
+    ("wavlm", {}, False),
+    ("sew", {}, False),
+    ("sew-d", {}, False),
+    ("unispeech", {}, False),
+    ("unispeech-sat", {}, False),
+    ("wav2vec2-bert", {}, False),
+    ("wav2vec2-conformer", {}, False),
+    ("musicgen", {}, False),
+    ("seamless_m4t", {}, False),
+    ("seamless_m4t_v2", {}, False),
+    ("speecht5", {}, False),
+    ("voxtral_encoder", {}, False),
+    ("mctct", {}, False),
+    # --- SenseVoiceSmall (CTC encoder-only ASR) ---
+    (
+        "sensevoice_small",
+        {
+            "audio": AudioConfig(
+                input_size=32,
+                attention_dim=TINY_HIDDEN,
+                attention_heads=TINY_HEADS,
+                linear_units=TINY_INTERMEDIATE,
+                kernel_size=5,
+                num_blocks=3,
+                tp_num_blocks=2,
+            ),
+        },
+        True,
+    ),
+    # --- RE-USE / SEMamba (spectral speech enhancement) ---
+    # Bidirectional Mamba over time and frequency; consumes a noisy STFT
+    # magnitude/phase pair rather than audio features.
+    (
+        "reuse",
+        {
+            "_config_cls": ReUseConfig,
+            "hid_feature": 8,
+            "num_tfmamba": 1,
+            "d_state": 4,
+            "d_conv": 4,
+            "expand": 2,
+            "n_fft": 32,
+            "hop_size": 4,
+            "win_size": 32,
+            "sampling_rate": 8000,
+        },
+        True,
+    ),
+]
+ALL_CONFIGS: list[tuple[str, dict, bool]] = (
+    CAUSAL_LM_CONFIGS
+    + ENCODER_CONFIGS
+    + SEQ2SEQ_CONFIGS
+    + VISION_CONFIGS
+    + DETECTION_CONFIGS
+    + SSM_CONFIGS
+    + VL_CONFIGS
+    + SPEECH_CONFIGS
+)
+
+# Model types explicitly declared in configs above (may have duplicates —
+# a model_type can appear more than once with different overrides).
+_EXPLICIT_MODEL_TYPES: set[str] = {mt for mt, _, _ in ALL_CONFIGS}
+
+# Internal aliases removed from test configs — they are still registered in
+# the registry but should not appear in any test parametrization.  Their real
+# HF model_type counterpart (or the underlying model class) is already tested.
+_EXCLUDED_ALIASES: set[str] = {
+    # Internal graph selected only after strict GGUF metadata validation.
+    "gguf_legacy",
+}
+
+
+# ---------------------------------------------------------------------------
+# Auto-generated entries for registered model types not covered above
+# ---------------------------------------------------------------------------
+def _auto_generated_configs() -> list[tuple[str, dict, bool]]:
+    """Return (model_type, {}, False) for registered types without explicit entries.
+
+    This ensures new registrations get basic graph-build coverage
+    automatically.
+
+    Only model types with the ``text-generation`` or
+    ``hybrid-text-generation`` task are auto-generated, since other tasks
+    (vision-language, speech, diffusion, etc.) require specialised configs
+    that cannot be guessed.
+    """
+    try:
+        from mobius._registry import registry
+        from mobius.integrations.transformers._config_resolver import (
+            _default_task_for_model,
+        )
+    except Exception:
+        return []
+
+    auto_tasks = {"text-generation", "hybrid-text-generation"}
+    auto: list[tuple[str, dict, bool]] = []
+    for model_type in sorted(registry.architectures()):
+        if model_type in _EXPLICIT_MODEL_TYPES:
+            continue
+        if model_type in _EXCLUDED_ALIASES:
+            continue
+        task = _default_task_for_model(model_type)
+        if task in auto_tasks:
+            auto.append((model_type, {}, False))
+    return auto
+
+
+AUTO_GENERATED_CONFIGS: list[tuple[str, dict, bool]] = _auto_generated_configs()
+
+ALL_CAUSAL_LM_CONFIGS: list[tuple[str, dict, bool]] = (
+    CAUSAL_LM_CONFIGS + AUTO_GENERATED_CONFIGS
+)
+
+FAST_CAUSAL_LM_CONFIGS: list[tuple[str, dict]] = [
+    (mt, ov) for mt, ov, rep in CAUSAL_LM_CONFIGS if rep
+]
+FAST_ENCODER_CONFIGS: list[tuple[str, dict]] = [
+    (mt, ov) for mt, ov, rep in ENCODER_CONFIGS if rep
+]
+FAST_SEQ2SEQ_CONFIGS: list[tuple[str, dict]] = [
+    (mt, ov) for mt, ov, rep in SEQ2SEQ_CONFIGS if rep
+]
+FAST_VISION_CONFIGS: list[tuple[str, dict]] = [
+    (mt, ov) for mt, ov, rep in VISION_CONFIGS if rep
+]
+FAST_DETECTION_CONFIGS: list[tuple[str, dict]] = [
+    (mt, ov) for mt, ov, rep in DETECTION_CONFIGS if rep
+]
+FAST_SSM_CONFIGS: list[tuple[str, dict]] = [(mt, ov) for mt, ov, rep in SSM_CONFIGS if rep]
+FAST_VL_CONFIGS: list[tuple[str, dict]] = [(mt, ov) for mt, ov, rep in VL_CONFIGS if rep]
+FAST_SPEECH_CONFIGS: list[tuple[str, dict]] = [
+    (mt, ov) for mt, ov, rep in SPEECH_CONFIGS if rep
+]

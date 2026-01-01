@@ -1,0 +1,17 @@
+model_id: "facebook/esm2_t6_8M_UR50D"
+model_type: "esm"
+revision: "main"
+task_type: "feature-extraction"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQVIVQDIAYLRSLGYNIVATPRGYVLAGG"
+
+level: "L4"
+
+notes: >-
+  ESM-2 8M protein language model (MIT licence). Not a BERT variant: rotary
+  positions, pre-LayerNorm blocks, a final emb_layer_norm_after, no token-type
+  embedding, and a token-dropout rescale that applies even with no mask token.
+  Handled by mobius.models.esm.EsmModel.

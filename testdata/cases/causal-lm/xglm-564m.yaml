@@ -1,0 +1,18 @@
+model_id: "facebook/xglm-564M"
+model_type: "xglm"
+revision: "f3059f01b98ccc877c673149e0178c0e957660f9"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+skip_reason: "No safetensors weights on HuggingFace Hub."
+notes: "XGLM 564M. Multilingual GPT variant with sinusoidal position embeddings."

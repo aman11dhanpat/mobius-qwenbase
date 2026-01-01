@@ -1,0 +1,287 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Tests for MLP component."""
+
+from __future__ import annotations
+
+from mobius._testing import (
+    count_op_type,
+    create_test_builder,
+    create_test_input,
+    make_config,
+)
+from mobius.components._mlp import FCMLP, MLP, FusedGateUpMLP, GatedMLP
+
+
+class TestMLP:
+    """Tests for the gated MLP (SwiGLU-style) component."""
+
+    def test_projection_shapes(self):
+        config = make_config()
+        mlp = MLP(config)
+        # gate_proj: (intermediate_size, hidden_size) = (128, 64)
+        assert list(mlp.gate_proj.weight.shape) == [128, 64]
+        # up_proj: same
+        assert list(mlp.up_proj.weight.shape) == [128, 64]
+        # down_proj: (hidden_size, intermediate_size) = (64, 128)
+        assert list(mlp.down_proj.weight.shape) == [64, 128]
+
+    def test_parameter_count_no_bias(self):
+        config = make_config()
+        mlp = MLP(config)
+        params = list(mlp.parameters())
+        # gate_proj.weight, up_proj.weight, down_proj.weight = 3
+        assert len(params) == 3
+
+    def test_parameter_count_with_bias(self):
+        config = make_config(mlp_bias=True)
+        mlp = MLP(config)
+        params = list(mlp.parameters())
+        # 3 weights + 3 biases = 6
+        assert len(params) == 6
+
+    def test_forward_builds_graph(self):
+        config = make_config()
+        mlp = MLP(config)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+
+        result = mlp(op, x)
+        builder._adapt_outputs([result], "")
+        assert graph.num_nodes() > 0
+        # gate_proj + up_proj + down_proj = at least 3 MatMul ops
+        assert count_op_type(graph, "MatMul") >= 3
+
+    def test_forward_has_mul_for_gating(self):
+        config = make_config()
+        mlp = MLP(config)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+
+        mlp(op, x)
+        # gate * up = at least 1 Mul op
+        assert count_op_type(graph, "Mul") >= 1
+
+    def test_silu_activation(self):
+        config = make_config(hidden_act="silu")
+        mlp = MLP(config)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+
+        mlp(op, x)
+        assert count_op_type(graph, "Swish") == 1
+        assert count_op_type(graph, "Sigmoid") == 0
+
+    def test_gelu_activation(self):
+        config = make_config(hidden_act="gelu")
+        mlp = MLP(config)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+
+        mlp(op, x)
+        assert count_op_type(graph, "Gelu") >= 1
+
+    def test_different_intermediate_size(self):
+        config = make_config(intermediate_size=256)
+        mlp = MLP(config)
+        assert list(mlp.gate_proj.weight.shape) == [256, 64]
+        assert list(mlp.down_proj.weight.shape) == [64, 256]
+
+
+class TestFCMLP:
+    """Tests for the two-layer FC MLP (non-gated) component."""
+
+    def test_projection_shapes(self):
+        mlp = FCMLP(hidden_size=64, intermediate_size=128)
+        # up_proj: (intermediate_size, hidden_size) = (128, 64)
+        assert list(mlp.up_proj.weight.shape) == [128, 64]
+        # down_proj: (hidden_size, intermediate_size) = (64, 128)
+        assert list(mlp.down_proj.weight.shape) == [64, 128]
+
+    def test_parameter_count_no_bias(self):
+        mlp = FCMLP(hidden_size=64, intermediate_size=128, bias=False)
+        params = list(mlp.parameters())
+        # up_proj.weight + down_proj.weight = 2
+        assert len(params) == 2
+
+    def test_parameter_count_with_bias(self):
+        mlp = FCMLP(hidden_size=64, intermediate_size=128, bias=True)
+        params = list(mlp.parameters())
+        # 2 weights + 2 biases = 4
+        assert len(params) == 4
+
+    def test_forward_builds_graph(self):
+        mlp = FCMLP(hidden_size=64, intermediate_size=128)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+
+        result = mlp(op, x)
+        builder._adapt_outputs([result], "")
+        assert graph.num_nodes() > 0
+        # up_proj + down_proj = exactly 2 MatMul ops
+        assert count_op_type(graph, "MatMul") == 2
+
+    def test_forward_has_no_mul_gating(self):
+        # FC MLP is not gated — there should be no elementwise Mul for gating
+        mlp = FCMLP(hidden_size=64, intermediate_size=128)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+
+        mlp(op, x)
+        assert count_op_type(graph, "Mul") == 0
+
+    def test_gelu_activation(self):
+        mlp = FCMLP(hidden_size=64, intermediate_size=128, activation="gelu")
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+
+        mlp(op, x)
+        assert count_op_type(graph, "Gelu") >= 1
+
+    def test_relu_activation(self):
+        mlp = FCMLP(hidden_size=64, intermediate_size=128, activation="relu")
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+
+        mlp(op, x)
+        assert count_op_type(graph, "Relu") >= 1
+
+    def test_different_intermediate_size(self):
+        mlp = FCMLP(hidden_size=64, intermediate_size=256)
+        assert list(mlp.up_proj.weight.shape) == [256, 64]
+        assert list(mlp.down_proj.weight.shape) == [64, 256]
+
+    def test_linear_class_used_for_projections(self):
+        # Verify linear_class is applied to both projection layers
+        from mobius.components._common import Linear
+
+        created = []
+
+        class TrackingLinear(Linear):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        mlp = FCMLP(hidden_size=64, intermediate_size=128, linear_class=TrackingLinear)
+        assert len(created) == 2
+        assert isinstance(mlp.up_proj, TrackingLinear)
+        assert isinstance(mlp.down_proj, TrackingLinear)
+
+
+class TestGatedMLP:
+    """Tests for GatedMLP (SwiGLU/GeGLU style gated MLP)."""
+
+    def test_projection_shapes(self):
+        mlp = GatedMLP(hidden_size=64, intermediate_size=128)
+        assert list(mlp.gate_proj.weight.shape) == [128, 64]
+        assert list(mlp.up_proj.weight.shape) == [128, 64]
+        assert list(mlp.down_proj.weight.shape) == [64, 128]
+
+    def test_parameter_count_no_bias(self):
+        mlp = GatedMLP(hidden_size=64, intermediate_size=128, bias=False)
+        params = list(mlp.parameters())
+        # gate_proj.weight + up_proj.weight + down_proj.weight = 3
+        assert len(params) == 3
+
+    def test_parameter_count_with_bias(self):
+        mlp = GatedMLP(hidden_size=64, intermediate_size=128, bias=True)
+        params = list(mlp.parameters())
+        # 3 weights + 3 biases = 6
+        assert len(params) == 6
+
+    def test_silu_activation(self):
+        mlp = GatedMLP(hidden_size=64, intermediate_size=128, activation="silu")
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+        mlp(op, x)
+        assert count_op_type(graph, "Swish") == 1
+        assert count_op_type(graph, "Sigmoid") == 0
+        assert count_op_type(graph, "Mul") >= 1
+
+    def test_gelu_activation(self):
+        mlp = GatedMLP(hidden_size=64, intermediate_size=128, activation="gelu")
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+        mlp(op, x)
+        assert count_op_type(graph, "Gelu") >= 1
+
+    def test_forward_builds_graph(self):
+        mlp = GatedMLP(hidden_size=64, intermediate_size=128)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+        result = mlp(op, x)
+        builder._adapt_outputs([result], "")
+        assert graph.num_nodes() > 0
+        assert count_op_type(graph, "MatMul") == 3
+
+    def test_linear_class_applied(self):
+        from mobius.components._common import Linear
+
+        created = []
+
+        class TrackingLinear(Linear):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        mlp = GatedMLP(hidden_size=64, intermediate_size=128, linear_class=TrackingLinear)
+        assert len(created) == 3
+        assert isinstance(mlp.gate_proj, TrackingLinear)
+        assert isinstance(mlp.up_proj, TrackingLinear)
+        assert isinstance(mlp.down_proj, TrackingLinear)
+
+
+class TestFusedGateUpMLP:
+    """Tests for FusedGateUpMLP (fused gate_up_proj, split activations)."""
+
+    def test_projection_shapes(self):
+        config = make_config(hidden_size=64, intermediate_size=128)
+        mlp = FusedGateUpMLP(config)
+        # gate_up_proj: [2*intermediate, hidden]
+        assert list(mlp.gate_up_proj.weight.shape) == [256, 64]
+        assert list(mlp.down_proj.weight.shape) == [64, 128]
+
+    def test_parameter_count(self):
+        config = make_config(hidden_size=64, intermediate_size=128)
+        mlp = FusedGateUpMLP(config)
+        # gate_up_proj.weight + down_proj.weight = 2 (no bias by default)
+        assert len(list(mlp.parameters())) == 2
+
+    def test_forward_builds_graph(self):
+        config = make_config(hidden_size=64, intermediate_size=128)
+        mlp = FusedGateUpMLP(config)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+        result = mlp(op, x)
+        builder._adapt_outputs([result], "")
+        assert graph.num_nodes() > 0
+        # gate_up_proj MatMul + down_proj MatMul = 2
+        assert count_op_type(graph, "MatMul") == 2
+        # Split activations along last axis
+        assert count_op_type(graph, "Split") == 1
+
+    def test_forward_uses_silu_by_default(self):
+        config = make_config(hidden_size=64, intermediate_size=128, hidden_act="silu")
+        mlp = FusedGateUpMLP(config)
+        builder, op, graph = create_test_builder()
+        x = create_test_input(builder, "x", [1, 8, 64])
+        mlp(op, x)
+        assert count_op_type(graph, "Swish") == 1
+        assert count_op_type(graph, "Sigmoid") == 0
+
+    def test_linear_class_applied(self):
+        from mobius.components._common import Linear
+
+        created = []
+
+        class TrackingLinear(Linear):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        config = make_config(hidden_size=64, intermediate_size=128)
+        mlp = FusedGateUpMLP(config, linear_class=TrackingLinear)
+        assert len(created) == 2
+        assert isinstance(mlp.gate_up_proj, TrackingLinear)
+        assert isinstance(mlp.down_proj, TrackingLinear)

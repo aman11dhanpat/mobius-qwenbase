@@ -1,0 +1,17 @@
+model_id: "HuggingFaceTB/SmolLM3-3B"
+model_type: "smollm3"
+revision: "a07cc9a04f16"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Once upon a time"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "SmolLM3 3B. Standard Llama architecture."

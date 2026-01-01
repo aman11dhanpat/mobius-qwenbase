@@ -1,0 +1,14 @@
+model_id: "facebook/vit-mae-base"
+model_type: "vit_mae"
+revision: "main"
+task_type: "image-classification"
+dtype: "float32"
+skip_reason: "ViT-MAE is a masked autoencoder, not a classifier — task mismatch."
+
+inputs:
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+level: "L4"
+
+notes: "ViT-MAE base. Masked autoencoder vision transformer."

@@ -1,0 +1,14 @@
+model_id: "answerdotai/ModernBERT-base"
+model_type: "modernbert"
+revision: "main"
+task_type: "feature-extraction"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "The quick brown fox jumps over the lazy dog."
+
+level: "L4"
+
+skip_reason: "ModernBERT preprocess_weights incomplete"
+notes: "ModernBERT base. Modern encoder with rotary embeddings and flash attention."

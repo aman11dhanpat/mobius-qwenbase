@@ -1,0 +1,1581 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Tests for ArchitectureConfig."""
+
+from __future__ import annotations
+
+import dataclasses
+from types import SimpleNamespace
+from typing import ClassVar
+
+import pytest
+
+from mobius._configs import (
+    DEFAULT_INT,
+    ArchitectureConfig,
+    AudioConfig,
+    GlmAsrConfig,
+    MuseGlimmerConfig,
+    QuantizationConfig,
+    QuantizedWeightFormat,
+    VisionConfig,
+    _extract_audio_config,
+    _extract_mrope_fields,
+    _extract_rope_config,
+    _extract_vision_config,
+    _nested_rope_theta,
+    _nested_rope_type,
+    _normalize_rope_scaling,
+)
+
+
+class TestArchitectureConfig:
+    def test_default_values(self):
+        config = ArchitectureConfig()
+        assert config.vocab_size == DEFAULT_INT
+        assert config.hidden_size == DEFAULT_INT
+        assert config.num_hidden_layers == DEFAULT_INT
+        assert config.rms_norm_eps == pytest.approx(1e-6)
+        # rope_type defaults to None (NoPE) so that directly-constructed
+        # ArchitectureConfig instances without an explicit rope_type are
+        # treated as having no RoPE, matching the signal from_transformers
+        # uses for NoPE models. The other RoPE fields keep inert numeric
+        # defaults so that specifying only rope_type="default" is enough
+        # for test / reproducer configs.
+        assert config.rope_type is None
+        assert config.rope_theta == pytest.approx(10_000.0)
+        assert config.partial_rotary_factor == pytest.approx(1.0)
+        assert config.attn_qkv_bias is False
+        assert config.attn_o_bias is False
+        assert config.attn_qk_norm is False
+        assert config.mlp_bias is False
+        assert config.tie_word_embeddings is False
+
+    def test_custom_values(self):
+        config = ArchitectureConfig(
+            vocab_size=32000,
+            hidden_size=4096,
+            num_hidden_layers=32,
+            num_attention_heads=32,
+            num_key_value_heads=8,
+            head_dim=128,
+            hidden_act="silu",
+        )
+        assert config.vocab_size == 32000
+        assert config.hidden_size == 4096
+        assert config.num_hidden_layers == 32
+        assert config.num_key_value_heads == 8
+        assert config.head_dim == 128
+        assert config.hidden_act == "silu"
+
+    def test_is_dataclass(self):
+        config = ArchitectureConfig()
+        assert dataclasses.is_dataclass(config)
+
+    def test_from_transformers_extracts_common_architectures(self):
+        """Spot-check that from_transformers works for common model types."""
+
+        class FakeLlamaConfig:
+            model_type = "llama"
+            num_attention_heads = 32
+            num_key_value_heads = 8
+            num_hidden_layers = 32
+            vocab_size = 32000
+            hidden_size = 4096
+            intermediate_size = 11008
+            hidden_act = "silu"
+            max_position_embeddings = 4096
+            head_dim = 128
+            pad_token_id = 0
+            rms_norm_eps = 1e-5
+            rope_theta = 10000.0
+            rope_scaling = None
+
+        config = ArchitectureConfig.from_transformers(FakeLlamaConfig())
+        assert config.vocab_size == 32000
+        assert config.hidden_size == 4096
+
+    def test_from_transformers_unknown_model_type_still_extracts_config(self):
+        """from_transformers() does not gate on model type — the registry handles validation."""
+
+        class FakeConfig:
+            model_type = "unsupported_model"
+            num_attention_heads = 8
+            num_key_value_heads = 4
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            hidden_act = "silu"
+            max_position_embeddings = 1024
+            head_dim = 32
+            pad_token_id = 0
+            rms_norm_eps = 1e-6
+            rope_theta = 10000.0
+            rope_scaling = None
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.vocab_size == 1000
+        assert config.hidden_size == 256
+
+    def test_from_transformers_muse_glimmer(self):
+        text_config = SimpleNamespace(
+            model_type="muse_glimmer_text",
+            vocab_size=202048,
+            hidden_size=6656,
+            intermediate_size=19968,
+            num_hidden_layers=4,
+            num_attention_heads=32,
+            num_key_value_heads=2,
+            head_dim=128,
+            hidden_activation="silu",
+            max_position_embeddings=131072,
+            rms_norm_eps=1e-5,
+            post_norm_eps=1e-8,
+            rope_parameters={"rope_type": "default", "rope_theta": 500000.0},
+            sliding_window=2048,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            layer_rope_theta=[500000.0, 500000.0, 500000.0, 0],
+            qk_scale_factor=3.87,
+            output_multiplier=0.19611613513818404,
+            final_logit_softcapping=20.0,
+            attention_bias=False,
+            tie_word_embeddings=False,
+            pad_token_id=None,
+        )
+        parent_config = SimpleNamespace(
+            model_type="muse_glimmer",
+            text_config=text_config,
+            vision_config={
+                "model_type": "muse_glimmer_vision",
+                "hidden_size": 1536,
+                "intermediate_size": 8960,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 16,
+                "hidden_act": "gelu",
+                "layer_norm_eps": 1e-5,
+                "patch_size": 14,
+                "patch_temporal": 2,
+                "merge_size": 2,
+                "pos_emb_height": 32,
+                "pos_emb_width": 32,
+                "layer_types": [
+                    "window_attention",
+                    "window_attention",
+                    "window_attention",
+                    "full_attention",
+                ],
+            },
+            projector_hidden_size=4096,
+            out_hidden_size=6144,
+            image_token_id=200092,
+            video_token_id=200091,
+        )
+
+        config = MuseGlimmerConfig.from_transformers(text_config, parent_config=parent_config)
+
+        assert config.model_type == "muse_glimmer_text"
+        assert config.hidden_size == 6656
+        assert config.layer_types[-1] == "full_attention"
+        assert config.layer_rope_theta == [500000.0, 500000.0, 500000.0, 0]
+        assert config.no_rope_layers == [3]
+        assert config.qk_scale_factor == pytest.approx(3.87)
+        assert config.attn_qk_norm is True
+        assert config.output_multiplier == pytest.approx(0.19611613513818404)
+        assert config.final_logit_softcapping == pytest.approx(20.0)
+        assert config.post_norm_eps == pytest.approx(1e-8)
+        assert config.image_token_id == 200092
+        assert config.video_token_id == 200091
+        assert config.vision is not None
+        assert config.vision.hidden_size == 1536
+        assert config.vision.head_dim == 96
+        assert config.vision.position_embedding_height == 32
+        assert config.vision.position_embedding_width == 32
+        assert config.vision.num_position_embeddings == 1024
+        assert config.vision.fullatt_block_indexes == [3]
+        assert config.vision.window_size == 448
+        assert config.vision.projector_intermediate_size == 4096
+        assert config.vision.out_hidden_size == 6144
+
+    def test_from_transformers_llama(self):
+        class FakeLlamaConfig:
+            model_type = "llama"
+            num_attention_heads = 32
+            num_key_value_heads = 8
+            num_hidden_layers = 32
+            vocab_size = 32000
+            hidden_size = 4096
+            intermediate_size = 11008
+            hidden_act = "silu"
+            max_position_embeddings = 4096
+            head_dim = 128
+            pad_token_id = 0
+            rms_norm_eps = 1e-5
+            rope_theta = 10000.0
+            rope_scaling = None
+            # Real HuggingFace LlamaConfig populates rope_parameters in
+            # __post_init__ for any model that declares RoPE support.
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
+
+        config = ArchitectureConfig.from_transformers(FakeLlamaConfig())
+        assert config.vocab_size == 32000
+        assert config.hidden_size == 4096
+        assert config.num_attention_heads == 32
+        assert config.num_key_value_heads == 8
+        assert config.head_dim == 128
+        assert config.hidden_act == "silu"
+        assert config.rope_type == "default"
+        assert config.attn_qkv_bias is False
+        assert config.attn_qk_norm is False
+        assert config.tie_word_embeddings is False
+
+    def test_from_transformers_qwen2_has_qkv_bias(self):
+        class FakeQwen2Config:
+            model_type = "qwen2"
+            num_attention_heads = 16
+            num_key_value_heads = 4
+            num_hidden_layers = 24
+            vocab_size = 151936
+            hidden_size = 2048
+            intermediate_size = 5504
+            hidden_act = "silu"
+            max_position_embeddings = 32768
+            head_dim = None
+            pad_token_id = 0
+            rms_norm_eps = 1e-6
+            rope_theta = 1000000.0
+            rope_scaling = None
+
+        config = ArchitectureConfig.from_transformers(FakeQwen2Config())
+        assert config.attn_qkv_bias is True
+        assert config.head_dim == 2048 // 16  # inferred from hidden_size / num_heads
+
+    def test_from_transformers_qwen3_has_qk_norm(self):
+        class FakeQwen3Config:
+            model_type = "qwen3"
+            num_attention_heads = 16
+            num_key_value_heads = 4
+            num_hidden_layers = 24
+            vocab_size = 151936
+            hidden_size = 2048
+            intermediate_size = 5504
+            hidden_act = "silu"
+            max_position_embeddings = 32768
+            head_dim = 128
+            pad_token_id = 0
+            rms_norm_eps = 1e-6
+            rope_theta = 1000000.0
+            rope_scaling = None
+
+        config = ArchitectureConfig.from_transformers(FakeQwen3Config())
+        assert config.attn_qk_norm is True
+
+    def test_from_transformers_chatglm4_legacy_fields(self):
+        class FakeChatGLMConfig:
+            model_type = "chatglm"
+            num_attention_heads = 32
+            multi_query_attention = True
+            multi_query_group_num = 2
+            num_layers = 40
+            hidden_size = 4096
+            ffn_hidden_size = 13696
+            kv_channels = 128
+            padded_vocab_size = 151552
+            vocab_size = 151552
+            seq_length = 131072
+            layernorm_epsilon = 1.5625e-7
+            add_bias_linear = False
+            add_qkv_bias = True
+            pad_token_id = 151329
+            tie_word_embeddings = False
+
+        config = ArchitectureConfig.from_transformers(FakeChatGLMConfig())
+
+        assert config.num_hidden_layers == 40
+        assert config.num_key_value_heads == 2
+        assert config.head_dim == 128
+        assert config.intermediate_size == 13696
+        assert config.hidden_act == "silu"
+        assert config.max_position_embeddings == 131072
+        assert config.partial_rotary_factor == pytest.approx(0.5)
+        assert config.rope_interleave is True
+        assert config.attn_qkv_bias is True
+        assert config.attn_o_bias is False
+        assert config.mlp_bias is False
+
+    def test_from_transformers_rope_scaling(self):
+        class FakeConfig:
+            model_type = "llama"
+            num_attention_heads = 32
+            num_key_value_heads = 8
+            num_hidden_layers = 32
+            vocab_size = 32000
+            hidden_size = 4096
+            intermediate_size = 11008
+            hidden_act = "silu"
+            max_position_embeddings = 131072
+            head_dim = 128
+            pad_token_id = 0
+            rms_norm_eps = 1e-5
+            rope_theta = 500000.0
+            rope_scaling: ClassVar[dict] = {
+                "rope_type": "llama3",
+                "factor": 8.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192,
+            }
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.rope_type == "llama3"
+        assert config.original_max_position_embeddings == 8192
+
+    def test_from_transformers_stores_model_type_and_token_ids(self):
+        """model_type, bos_token_id, eos_token_id are preserved on ArchitectureConfig."""
+
+        class FakeConfig:
+            model_type = "gemma2"
+            num_attention_heads = 8
+            num_key_value_heads = 4
+            num_hidden_layers = 2
+            vocab_size = 256
+            hidden_size = 64
+            intermediate_size = 128
+            hidden_act = "gelu"
+            max_position_embeddings = 128
+            head_dim = 8
+            pad_token_id = 0
+            bos_token_id = 2
+            eos_token_id = 1
+            rms_norm_eps = 1e-6
+            rope_theta = 10000.0
+            rope_scaling = None
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.model_type == "gemma2"
+        assert config.bos_token_id == 2
+        assert config.eos_token_id == 1
+
+    def test_from_transformers_nope_model_has_none_rope(self):
+        """NoPE models (e.g. NemotronH) get ``rope=None`` and ``rope_type=None``.
+
+        This is the Phase 1 fix for the silent-RoPE-on-NoPE-models bug:
+        when the HuggingFace config declares neither ``rope_parameters``
+        nor ``rope_scaling`` nor the legacy ``rotary_dim`` / ``rotary_pct``
+        / ``rotary_emb_base`` fields, the resulting ``ArchitectureConfig``
+        must express "no RoPE" structurally so that ``initialize_rope``
+        returns ``None`` and ``TextModel`` skips rotary encoding entirely.
+        """
+
+        class FakeNemotronH:
+            # Minimal NemotronH-like config: carries a stale ``rope_theta``
+            # as dead data but declares NO ``rope_parameters`` / ``rope_scaling``
+            # / ``rotary_*`` fields — so this is a NoPE model.
+            model_type = "nemotron_h"
+            num_attention_heads = 8
+            num_key_value_heads = 2
+            num_hidden_layers = 4
+            vocab_size = 128
+            hidden_size = 64
+            intermediate_size = 128
+            hidden_act = "relu2"
+            max_position_embeddings = 128
+            head_dim = 8
+            pad_token_id = 0
+            rms_norm_eps = 1e-6
+            rope_theta = 10_000.0  # stale — ignored because no rope_parameters
+
+        config = ArchitectureConfig.from_transformers(FakeNemotronH())
+        # Sub-config is None: no RoPE data exists at all.
+        assert config.rope is None
+        # Flat fields are all None: no spurious "default" values.
+        assert config.rope_type is None
+        assert config.rope_theta is None
+        assert config.partial_rotary_factor is None
+        assert config.rope_scaling is None
+        assert config.rope_local_base_freq is None
+        assert config.original_max_position_embeddings is None
+        # rope_interleave stays at its inert False default.
+        assert config.rope_interleave is False
+
+    def test_from_transformers_legacy_rotary_dim_enables_rope(self):
+        """GPT-J / CodeGen-style legacy configs use ``rotary_dim``."""
+
+        class FakeGPTJ:
+            model_type = "gptj"
+            num_attention_heads = 4
+            num_key_value_heads = 4
+            num_hidden_layers = 2
+            vocab_size = 128
+            hidden_size = 64
+            intermediate_size = 128
+            hidden_act = "gelu"
+            max_position_embeddings = 128
+            head_dim = 16
+            pad_token_id = 0
+            rms_norm_eps = 1e-6
+            rotary_dim = 8  # legacy partial-RoPE signal
+
+        config = ArchitectureConfig.from_transformers(FakeGPTJ())
+        # Legacy rotary_dim activates RoPE with partial_rotary_factor = 8/16.
+        assert config.rope is not None
+        assert config.rope_type == "default"
+        assert config.partial_rotary_factor == pytest.approx(0.5)
+
+
+class TestExtractRopeConfig:
+    """Unit tests for _extract_rope_config helper."""
+
+    def test_defaults_when_no_rope_attrs(self):
+        """Bare config with no RoPE signal yields ``None`` (NoPE model)."""
+
+        class Bare:
+            pass
+
+        result = _extract_rope_config(Bare())
+        assert result is None
+
+    def test_rope_theta_alone_is_not_a_rope_signal(self):
+        """rope_theta without rope_parameters/rope_scaling is not a RoPE signal.
+
+        For example NemotronH carries ``rope_theta`` as dead data while
+        declaring no actual RoPE support — so the absence of
+        ``rope_parameters`` / ``rope_scaling`` / legacy rotary fields must
+        produce ``None`` (NoPE), not a spurious ``RoPEConfig``.
+        """
+
+        class Cfg:
+            # No rope_scaling, no rope_parameters — just a stale rope_theta.
+            rope_theta = 10_000.0
+
+        assert _extract_rope_config(Cfg()) is None
+
+    def test_nondefault_rope_theta_without_rope_scaling_activates_rope(self):
+        """Non-default rope_theta alone (e.g. 50000) is treated as a RoPE signal.
+
+        Models like Arctic and Jamba set a custom rope_theta without
+        exposing rope_scaling in their config JSON.  The non-default value
+        distinguishes them from NoPE models that inherit 10000.0 as dead data.
+        """
+
+        class Cfg:
+            rope_theta = 50_000.0  # no rope_scaling, no rope_parameters
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.rope_type == "default"
+        assert result.rope_theta == pytest.approx(50_000.0)
+
+    def test_rope_parameters_activates_rope(self):
+        """``rope_parameters`` on the HF config is the modern RoPE signal."""
+
+        class Cfg:
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.rope_type == "default"
+
+    def test_legacy_rotary_dim_activates_rope(self):
+        """Legacy GPT-J / CodeGen configs use ``rotary_dim``."""
+
+        class Cfg:
+            rotary_dim = 64
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.rope_type == "default"
+
+    def test_rope_theta_from_config_attr(self):
+        class Cfg:
+            rope_theta = 500_000.0
+            # rope_parameters triggers the RoPE path so rope_theta is read.
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.rope_theta == pytest.approx(500_000.0)
+
+    def test_rope_type_from_rope_scaling(self):
+        class Cfg:
+            rope_scaling: ClassVar[dict] = {"rope_type": "llama3", "factor": 8.0}
+
+        result = _extract_rope_config(Cfg())
+        assert result.rope_type == "llama3"
+
+    def test_partial_rotary_factor(self):
+        class Cfg:
+            partial_rotary_factor = 0.5
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.partial_rotary_factor == pytest.approx(0.5)
+
+    def test_partial_rotary_factor_zero_is_preserved(self):
+        """partial_rotary_factor=0.0 must NOT be replaced by default 1.0."""
+
+        class Cfg:
+            partial_rotary_factor = 0.0
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.partial_rotary_factor == pytest.approx(0.0)
+
+    def test_rope_theta_zero_is_preserved(self):
+        """rope_theta=0.0 must NOT be replaced by default 10000.0."""
+
+        class Cfg:
+            rope_theta = 0.0
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.rope_theta == pytest.approx(0.0)
+
+    def test_mrope_interleaved_from_rope_scaling(self):
+        class Cfg:
+            rope_scaling: ClassVar[dict] = {
+                "mrope_interleaved": True,
+                "mrope_section": [16, 24, 24],
+            }
+
+        result = _extract_mrope_fields(Cfg())
+        assert result["mrope_interleaved"] is True
+        assert result["mrope_section"] == [16, 24, 24]
+
+    def test_mrope_interleaved_from_rope_parameters(self):
+        class Cfg:
+            rope_scaling = None
+            rope_parameters: ClassVar[dict] = {
+                "mrope_interleaved": True,
+                "mrope_section": [8, 16, 8],
+            }
+
+        result = _extract_mrope_fields(Cfg())
+        assert result["mrope_interleaved"] is True
+        assert result["mrope_section"] == [8, 16, 8]
+
+    def test_mrope_interleaved_alias_from_rope_scaling(self):
+        """Qwen3-TTS talker spells the flag as bare ``interleaved``."""
+
+        class Cfg:
+            rope_scaling: ClassVar[dict] = {
+                "interleaved": True,
+                "mrope_section": [24, 20, 20],
+                "rope_type": "default",
+            }
+
+        result = _extract_mrope_fields(Cfg())
+        assert result["mrope_interleaved"] is True
+        assert result["mrope_section"] == [24, 20, 20]
+
+    def test_original_max_position_embeddings(self):
+        class Cfg:
+            original_max_position_embeddings = 8192
+            rope_parameters: ClassVar[dict] = {"rope_type": "default"}
+
+        result = _extract_rope_config(Cfg())
+        assert result is not None
+        assert result.original_max_position_embeddings == 8192
+
+
+class TestExtractVisionConfig:
+    """Unit tests for _extract_vision_config helper."""
+
+    def test_no_vision_returns_empty(self):
+        """Config with no vision_config yields empty dict."""
+
+        class Cfg:
+            pass
+
+        result = _extract_vision_config(Cfg(), None, "llama")
+        assert result == {}
+
+    def test_basic_vision_config(self):
+        """Extract standard vision fields into VisionConfig."""
+
+        class VC:
+            hidden_size = 1024
+            intermediate_size = 4096
+            num_hidden_layers = 24
+            num_attention_heads = 16
+            image_size = 384
+            patch_size = 14
+            layer_norm_eps = 1e-6
+
+        class Cfg:
+            vision_config = VC()
+            mm_tokens_per_image = None
+            image_token_id = 32000
+
+        result = _extract_vision_config(Cfg(), None, "llava")
+        assert "vision" in result
+        assert isinstance(result["vision"], VisionConfig)
+        assert result["vision"].hidden_size == 1024
+        assert result["vision"].num_hidden_layers == 24
+        assert result["vision"].image_token_id == 32000
+
+    def test_vision_config_as_dict(self):
+        """vision_config can be a plain dict (some HF configs)."""
+
+        class Cfg:
+            vision_config: ClassVar[dict] = {
+                "hidden_size": 768,
+                "intermediate_size": 3072,
+                "num_hidden_layers": 12,
+                "num_attention_heads": 12,
+                "image_size": 224,
+                "patch_size": 16,
+            }
+            mm_tokens_per_image = None
+            image_token_id = None
+
+        result = _extract_vision_config(Cfg(), None, "llava")
+        assert result["vision"].hidden_size == 768
+        assert result["vision"].patch_size == 16
+
+    def test_mrope_section_from_composite_vl(self):
+        """VL models pass mrope_section through vision helper."""
+
+        class TextCfg:
+            rope_scaling: ClassVar[dict] = {"mrope_section": [16, 24, 24]}
+            vision_config = None
+
+        class ParentCfg:
+            vision_config = type(
+                "VC",
+                (),
+                {
+                    "hidden_size": 1024,
+                    "intermediate_size": 4096,
+                    "num_hidden_layers": 24,
+                    "num_attention_heads": 16,
+                    "image_size": 384,
+                    "patch_size": 14,
+                    "layer_norm_eps": 1e-6,
+                },
+            )()
+            mm_tokens_per_image = None
+            image_token_id = 151655
+
+        result = _extract_vision_config(TextCfg(), ParentCfg(), "qwen2_vl")
+        assert result["vision"].mrope_section == [16, 24, 24]
+
+    def test_phi4mm_hardcoded_vision(self):
+        """phi4mm uses hardcoded SigLIP vision encoder params."""
+
+        class Cfg:
+            vision_config = None
+            mm_tokens_per_image = None
+            image_token_id = None
+            special_image_token_id = 200010
+            embd_layer: ClassVar[dict] = {"image_embd_layer": {"crop_size": 448}}
+
+        result = _extract_vision_config(Cfg(), None, "phi4mm")
+        assert result["vision"].hidden_size == 1152
+        assert result["vision"].num_hidden_layers == 27
+        assert result["vision"].image_token_id == 200010
+
+
+class TestExtractAudioConfig:
+    """Unit tests for _extract_audio_config helper."""
+
+    def test_no_audio_returns_empty(self):
+        """Config with no audio attributes yields empty dict."""
+
+        class Cfg:
+            pass
+
+        result = _extract_audio_config(Cfg(), None, "llama")
+        assert result == {}
+
+    def test_audio_processor_config(self):
+        """Extract audio fields from audio_processor.config dict."""
+
+        class Cfg:
+            audio_processor: ClassVar[dict] = {
+                "config": {
+                    "attention_dim": 512,
+                    "attention_heads": 8,
+                    "num_blocks": 6,
+                    "linear_units": 2048,
+                    "kernel_size": 31,
+                    "input_size": 80,
+                    "nemo_conv_settings": {"conv_channels": 256},
+                    "relative_attention_bias_args": {"t5_bias_max_distance": 64},
+                }
+            }
+
+        result = _extract_audio_config(Cfg(), None, "phi4mm")
+        assert "audio" in result
+        assert isinstance(result["audio"], AudioConfig)
+        assert result["audio"].attention_dim == 512
+        assert result["audio"].attention_heads == 8
+        assert result["audio"].t5_bias_max_distance == 64
+
+    def test_qwen3_asr_thinker_config(self):
+        """Qwen3-ASR extracts audio from thinker_config."""
+
+        class Cfg:
+            thinker_config = type(
+                "TC",
+                (),
+                {
+                    "audio_config": type(
+                        "AC",
+                        (),
+                        {
+                            "d_model": 1280,
+                            "encoder_layers": 32,
+                            "encoder_attention_heads": 20,
+                            "encoder_ffn_dim": 5120,
+                            "num_mel_bins": 128,
+                            "max_source_positions": 1500,
+                            "downsample_hidden_size": 1024,
+                            "output_dim": 2048,
+                            "activation_function": "gelu",
+                        },
+                    )(),
+                    "audio_token_id": 151646,
+                    "audio_start_token_id": 151647,
+                    "audio_end_token_id": 151648,
+                    "classify_num": None,
+                },
+            )()
+
+        result = _extract_audio_config(Cfg(), None, "qwen3_asr")
+        assert result["audio"].d_model == 1280
+        assert result["audio"].encoder_layers == 32
+        assert result["audio"].audio_token_id == 151646
+
+    def test_glmasr_nested_config(self):
+        """GLM-ASR unwraps its Llama text config and preserves audio metadata."""
+        text_config = SimpleNamespace(
+            model_type="llama",
+            vocab_size=59264,
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=28,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            head_dim=128,
+            hidden_act="silu",
+            max_position_embeddings=32768,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_type": "default", "rope_theta": 500000.0},
+            tie_word_embeddings=True,
+            pad_token_id=59263,
+        )
+        audio_config = SimpleNamespace(
+            hidden_size=1280,
+            intermediate_size=5120,
+            num_hidden_layers=32,
+            num_attention_heads=20,
+            num_key_value_heads=20,
+            head_dim=64,
+            partial_rotary_factor=0.5,
+            rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+            layer_norm_eps=1e-5,
+            num_mel_bins=128,
+            max_position_embeddings=1500,
+            hidden_act="gelu",
+        )
+        parent = SimpleNamespace(
+            model_type="glmasr",
+            text_config=text_config,
+            audio_config=audio_config,
+            audio_token_id=59260,
+            projector_hidden_act="gelu",
+            tie_word_embeddings=True,
+            dtype="bfloat16",
+        )
+
+        config = GlmAsrConfig.from_transformers(parent)
+
+        assert config.model_type == "glmasr"
+        assert config.hidden_size == 2048
+        assert config.num_hidden_layers == 28
+        assert config.num_key_value_heads == 4
+        assert config.audio_token_id == 59260
+        assert config.audio is not None
+        assert config.audio.d_model == 1280
+        assert config.audio.encoder_head_dim == 64
+        assert config.audio.encoder_partial_rotary_factor == pytest.approx(0.5)
+        assert config.audio.encoder_rope_theta == pytest.approx(10000.0)
+        assert config.audio.output_dim == 2048
+
+    def test_phi4mm_audio_token_id(self):
+        """phi4mm extracts audio_token_id from audio_config attr."""
+
+        class Cfg:
+            audio_config: ClassVar[dict] = {"audio_token_id": 200011}
+
+        result = _extract_audio_config(Cfg(), None, "phi4mm")
+        assert result["audio"].token_id == 200011
+
+
+class TestExtractRopeConfigFallbacks:
+    """Tests for older HF format fallbacks and nested rope_scaling."""
+
+    def test_rope_type_from_type_key(self):
+        """Older HF configs use 'type' instead of 'rope_type'."""
+
+        class Cfg:
+            rope_scaling: ClassVar[dict] = {"type": "dynamic", "factor": 2.0}
+
+        result = _extract_rope_config(Cfg())
+        assert result.rope_type == "dynamic"
+
+    def test_rope_type_from_nested_full_attention(self):
+        """Gemma3 nests rope config under full_attention key."""
+
+        class Cfg:
+            rope_scaling: ClassVar[dict] = {
+                "full_attention": {
+                    "rope_type": "linear",
+                    "factor": 8.0,
+                    "rope_theta": 100_000.0,
+                },
+                "sliding_attention": {
+                    "rope_type": "default",
+                    "rope_theta": 10_000.0,
+                },
+            }
+
+        result = _extract_rope_config(Cfg())
+        assert result.rope_type == "linear"
+        assert result.rope_theta == pytest.approx(100_000.0)
+        assert result.rope_local_base_freq == pytest.approx(10_000.0)
+        # rope_scaling should be normalized to the full_attention sub-dict
+        assert result.rope_scaling["factor"] == pytest.approx(8.0)
+        assert "full_attention" not in result.rope_scaling
+
+
+class TestNestedRopeHelpers:
+    """Unit tests for nested rope helpers.
+
+    Covers _nested_rope_theta, _nested_rope_type, _normalize_rope_scaling.
+    """
+
+    def test_nested_rope_theta_found(self):
+        scaling = {"full_attention": {"rope_theta": 50_000.0}}
+        assert _nested_rope_theta(scaling, "full_attention") == pytest.approx(50_000.0)
+
+    def test_nested_rope_theta_missing_key(self):
+        assert _nested_rope_theta({}, "full_attention") is None
+
+    def test_nested_rope_theta_not_dict(self):
+        assert _nested_rope_theta({"full_attention": "not_a_dict"}, "full_attention") is None
+
+    def test_nested_rope_type_found(self):
+        scaling = {"full_attention": {"rope_type": "linear"}}
+        assert _nested_rope_type(scaling, "full_attention") == "linear"
+
+    def test_nested_rope_type_missing_key(self):
+        assert _nested_rope_type({}, "sliding_attention") is None
+
+    def test_normalize_rope_scaling_empty(self):
+        assert _normalize_rope_scaling({}) == {}
+
+    def test_normalize_rope_scaling_flat(self):
+        flat = {"rope_type": "llama3", "factor": 8.0}
+        assert _normalize_rope_scaling(flat) == flat
+
+    def test_normalize_rope_scaling_gemma3(self):
+        nested = {
+            "full_attention": {"rope_type": "linear", "factor": 8.0},
+            "sliding_attention": {"rope_type": "default"},
+        }
+        result = _normalize_rope_scaling(nested)
+        assert result == {"rope_type": "linear", "factor": 8.0}
+
+
+class TestVisionConfigBidirectionalSync:
+    """Tests for __post_init__ VisionConfig ↔ flat field sync."""
+
+    def test_nested_vision_config_works(self):
+        vc = VisionConfig(hidden_size=64, num_attention_heads=4)
+        config = ArchitectureConfig(vision=vc)
+        assert config.vision.hidden_size == 64
+        assert config.vision.num_attention_heads == 4
+
+    def test_no_vision_fields_keeps_vision_none(self):
+        config = ArchitectureConfig(hidden_size=128)
+        assert config.vision is None
+
+
+class TestQuantizationConfig:
+    def test_defaults(self):
+        qc = QuantizationConfig()
+        assert qc.bits == 4
+        assert qc.group_size == 128
+        assert qc.quant_method == "none"
+        assert qc.sym is True
+
+    def test_new_weight_format_preserves_existing_positional_arguments(self):
+        qc = QuantizationConfig(8, 64, "olive", False, True, True, False, True, True)
+
+        assert qc.float_zero_point is True
+        assert qc.quantize_embeddings is True
+        assert qc.quantize_lm_head is False
+        assert qc.quantize_vision is True
+        assert qc.tie_word_embeddings is True
+        assert qc.weight_format is QuantizedWeightFormat.INTEGER_AFFINE
+
+    def test_serialized_weight_format_is_normalized_to_enum(self):
+        qc = QuantizationConfig(
+            quant_method="manual",
+            weight_format="mxfp4",  # type: ignore[arg-type]
+        )
+
+        assert qc.weight_format is QuantizedWeightFormat.MXFP4
+
+    def test_quant_method_alone_does_not_infer_native_storage(self):
+        qc = QuantizationConfig(quant_method="mxfp4")
+
+        assert qc.weight_format is QuantizedWeightFormat.INTEGER_AFFINE
+
+    def test_from_transformers_gptq_dict(self):
+        """Parse a GPTQ quantization_config dict."""
+        hf = type(
+            "HFConfig",
+            (),
+            {
+                "quantization_config": {
+                    "quant_method": "gptq",
+                    "bits": 4,
+                    "group_size": 128,
+                    "sym": True,
+                }
+            },
+        )()
+        qc = QuantizationConfig.from_transformers(hf)
+        assert qc is not None
+        assert qc.quant_method == "gptq"
+        assert qc.bits == 4
+        assert qc.group_size == 128
+        assert qc.sym is True
+
+    def test_from_transformers_awq(self):
+        hf = type(
+            "HFConfig",
+            (),
+            {
+                "quantization_config": {
+                    "quant_method": "awq",
+                    "bits": 4,
+                    "group_size": 64,
+                    "sym": False,
+                }
+            },
+        )()
+        qc = QuantizationConfig.from_transformers(hf)
+        assert qc is not None
+        assert qc.quant_method == "awq"
+        assert qc.group_size == 64
+        assert qc.sym is False
+
+    def test_from_transformers_no_quant_config(self):
+        hf = type("HFConfig", (), {})()
+        assert QuantizationConfig.from_transformers(hf) is None
+
+    def test_from_transformers_none_quant_config(self):
+        hf = type("HFConfig", (), {"quantization_config": None})()
+        assert QuantizationConfig.from_transformers(hf) is None
+
+    def test_from_transformers_method_none_returns_none(self):
+        hf = type("HFConfig", (), {"quantization_config": {"quant_method": "none"}})()
+        assert QuantizationConfig.from_transformers(hf) is None
+
+    def test_from_transformers_fp8_returns_none(self):
+        """FP8 per-tensor quantization is not block quantization; returns None."""
+        hf = type(
+            "HFConfig",
+            (),
+            {"quantization_config": {"quant_method": "fp8", "bits": 8}},
+        )()
+        assert QuantizationConfig.from_transformers(hf) is None
+
+    def test_from_transformers_modelopt_nvfp4_raises(self):
+        """ModelOpt NVFP4/FP8 checkpoints fail loudly rather than mis-quantizing.
+
+        The INT4 path would silently mis-dequantize packed E2M1/float8 weights,
+        so ``from_transformers`` raises until the ModelOpt loader is wired.
+        """
+        import pytest
+
+        for qc in (
+            {"quant_method": "modelopt"},
+            {"quant_method": "modelopt", "quant_algo": "NVFP4"},
+            {"quant_algo": "W4A16_NVFP4"},
+            {"quant_algo": "FP8"},
+        ):
+            hf = type("HFConfig", (), {"quantization_config": qc})()
+            with pytest.raises(NotImplementedError, match="ModelOpt"):
+                QuantizationConfig.from_transformers(hf)
+
+    def test_from_transformers_to_dict_object(self):
+        """HF QuantizationConfig objects have a to_dict() method."""
+        inner = type(
+            "QC",
+            (),
+            {
+                "to_dict": lambda self: {
+                    "quant_method": "gptq",
+                    "bits": 8,
+                    "group_size": 32,
+                    "sym": False,
+                }
+            },
+        )()
+        hf = type("HFConfig", (), {"quantization_config": inner})()
+        qc = QuantizationConfig.from_transformers(hf)
+        assert qc is not None
+        assert qc.bits == 8
+        assert qc.group_size == 32
+
+    def test_from_transformers_symmetric_key_fallback(self):
+        """Olive uses ``symmetric`` rather than GPTQ's ``sym`` key."""
+        hf = type(
+            "HFConfig",
+            (),
+            {
+                "quantization_config": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                    "symmetric": False,
+                }
+            },
+        )()
+        qc = QuantizationConfig.from_transformers(hf)
+        assert qc is not None
+        assert qc.sym is False
+
+    def test_from_transformers_olive_component_flags(self):
+        """Olive RTN exports flags for quantized tables and vision projections."""
+        hf = type(
+            "HFConfig",
+            (),
+            {
+                "quantization_config": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                    "embeds": True,
+                    "lm_head": True,
+                    "quantize_vision": True,
+                }
+            },
+        )()
+        qc = QuantizationConfig.from_transformers(hf)
+        assert qc is not None
+        assert qc.quantize_embeddings is True
+        assert qc.quantize_lm_head is True
+        assert qc.quantize_vision is True
+
+    def test_component_plan_matches_exact_and_regex_module_rules(self):
+        qc = QuantizationConfig.from_value(
+            {
+                "quant_method": "olive",
+                "bits": 4,
+                "group_size": 32,
+                "modules_to_not_convert": [
+                    r"re:.*\.per_layer_input_gate",
+                ],
+                "overrides": {
+                    "model.layers.0.q_proj": {
+                        "bits": 8,
+                        "group_size": 64,
+                    }
+                },
+            }
+        )
+
+        assert qc is not None
+        assert qc.for_module(("model.language_model.layers.0.per_layer_input_gate",)) is None
+        overridden = qc.for_module(("model.layers.0.q_proj",))
+        assert overridden is not None
+        assert (overridden.bits, overridden.group_size) == (8, 64)
+
+    def test_invalid_component_regex_fails_during_config_parse(self):
+        with pytest.raises(ValueError, match="Invalid quantization regex"):
+            QuantizationConfig.from_value(
+                {
+                    "quant_method": "olive",
+                    "modules_to_not_convert": ["re:("],
+                }
+            )
+
+    @pytest.mark.parametrize("rule", ["exclusion", "override"])
+    @pytest.mark.parametrize(
+        ("module_name", "matches"),
+        [
+            ("model.layers.1", True),
+            ("model.layers.1.self_attn.q_proj", True),
+            ("model.layers.10.self_attn.q_proj", False),
+            ("model.layers.1_extra", False),
+            ("other.model.layers.1.self_attn.q_proj", False),
+        ],
+    )
+    def test_literal_module_rules_respect_path_boundaries(self, rule, module_name, matches):
+        policy = (
+            {"modules_to_not_convert": ["model.layers.1"]}
+            if rule == "exclusion"
+            else {"overrides": {"model.layers.1": {"bits": 8, "group_size": 64}}}
+        )
+        qc = QuantizationConfig.from_value(
+            {"quant_method": "olive", "bits": 4, "group_size": 32, **policy}
+        )
+        assert qc is not None
+
+        resolved = qc.for_module((module_name,))
+
+        if rule == "exclusion" and matches:
+            assert resolved is None
+        else:
+            assert resolved is not None
+            expected = (8, 64) if matches else (4, 32)
+            assert (resolved.bits, resolved.group_size) == expected
+
+    def test_architecture_config_parses_explicit_component_quantization(self):
+        text = SimpleNamespace(
+            model_type="llama",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=256,
+            hidden_act="silu",
+            max_position_embeddings=128,
+        )
+        parent = SimpleNamespace(
+            model_type="composite",
+            component_quantization={
+                "decoder": {
+                    "quant_method": "olive",
+                    "bits": 4,
+                    "group_size": 32,
+                    "modules_to_not_convert": [
+                        r"re:.*\.per_layer_projection",
+                    ],
+                },
+                "vision": {
+                    "quant_method": "olive",
+                    "bits": 8,
+                    "group_size": 64,
+                },
+            },
+        )
+
+        config = ArchitectureConfig.from_transformers(text, parent_config=parent)
+
+        assert config.component_quantization is not None
+        assert config.quantization_for("decoder").bits == 4
+        assert config.quantization_for("vision_encoder").bits == 8
+        assert config.quantization_for("decoder").modules_to_not_convert
+
+    def test_quantize_component_flags_default_false(self):
+        qc = QuantizationConfig()
+        assert qc.quantize_embeddings is False
+        assert qc.quantize_lm_head is False
+        assert qc.quantize_vision is False
+
+    def test_architecture_config_has_quantization_field(self):
+        config = ArchitectureConfig()
+        assert config.quantization is None
+
+    def test_architecture_config_accepts_quantization(self):
+        qc = QuantizationConfig(bits=4, group_size=128, quant_method="gptq")
+        config = ArchitectureConfig(quantization=qc)
+        assert config.quantization is not None
+        assert config.quantization.quant_method == "gptq"
+
+
+class TestArchitectureConfigValidate:
+    """Tests for ArchitectureConfig.validate()."""
+
+    def _make_valid_config(self, **overrides):
+        defaults = dict(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            vocab_size=256,
+            head_dim=16,
+            num_key_value_heads=2,
+            intermediate_size=128,
+        )
+        defaults.update(overrides)
+        return ArchitectureConfig(**defaults)
+
+    def test_valid_config_passes(self):
+        config = self._make_valid_config()
+        config.validate()  # Should not raise
+
+    def test_zero_hidden_size_fails(self):
+        config = self._make_valid_config(hidden_size=0)
+        with pytest.raises(ValueError, match="hidden_size must be positive"):
+            config.validate()
+
+    def test_negative_hidden_size_fails(self):
+        config = self._make_valid_config(hidden_size=-1)
+        with pytest.raises(ValueError, match="hidden_size must be positive"):
+            config.validate()
+
+    def test_zero_num_heads_fails(self):
+        config = self._make_valid_config(num_attention_heads=0)
+        with pytest.raises(ValueError, match="num_attention_heads must be positive"):
+            config.validate()
+
+    def test_zero_vocab_size_is_allowed(self):
+        """Encoder-only vision models legitimately have vocab_size=0."""
+        config = self._make_valid_config(vocab_size=0)
+        config.validate()  # Should not raise
+
+    def test_zero_num_layers_fails(self):
+        config = self._make_valid_config(num_hidden_layers=0)
+        with pytest.raises(ValueError, match="num_hidden_layers must be positive"):
+            config.validate()
+
+    def test_zero_head_dim_fails(self):
+        config = self._make_valid_config(head_dim=0)
+        with pytest.raises(ValueError, match="head_dim must be positive"):
+            config.validate()
+
+    def test_heads_not_dividing_kv_heads_fails(self):
+        config = self._make_valid_config(
+            num_attention_heads=5,
+            num_key_value_heads=3,
+            hidden_size=80,
+            head_dim=16,
+        )
+        with pytest.raises(ValueError, match="divisible by num_key_value_heads"):
+            config.validate()
+
+    def test_hidden_size_not_divisible_by_heads_fails(self):
+        # Only applies when head_dim is not explicitly set (DEFAULT_INT)
+        config = self._make_valid_config(
+            hidden_size=65,
+            num_attention_heads=4,
+            head_dim=DEFAULT_INT,
+            num_key_value_heads=2,
+        )
+        with pytest.raises(ValueError, match=r"hidden_size.*divisible by num_attention_heads"):
+            config.validate()
+
+    def test_hidden_size_not_divisible_by_heads_ok_with_explicit_head_dim(self):
+        # Models like Qwen3.5 set head_dim explicitly, so the check is skipped
+        config = self._make_valid_config(
+            hidden_size=65,
+            num_attention_heads=4,
+            head_dim=16,
+            num_key_value_heads=2,
+        )
+        config.validate()  # Should not raise
+
+    def test_zero_intermediate_size_fails(self):
+        config = self._make_valid_config(intermediate_size=0)
+        with pytest.raises(ValueError, match="intermediate_size must be positive"):
+            config.validate()
+
+    def test_negative_intermediate_size_fails(self):
+        config = self._make_valid_config(intermediate_size=-1)
+        with pytest.raises(ValueError, match="intermediate_size must be positive"):
+            config.validate()
+
+    def test_none_intermediate_size_passes(self):
+        config = self._make_valid_config(intermediate_size=None)
+        config.validate()  # None means model doesn't use MLP
+
+    def test_multiple_errors_reported(self):
+        config = self._make_valid_config(
+            hidden_size=0,
+            num_hidden_layers=0,
+        )
+        with pytest.raises(ValueError) as exc_info:
+            config.validate()
+        msg = str(exc_info.value)
+        assert "hidden_size" in msg
+        assert "num_hidden_layers" in msg
+
+
+class TestGemma4Config:
+    """Tests for Gemma4Config.from_transformers."""
+
+    @staticmethod
+    def _heterogeneous_config(*head_dims, layer_types=None, kv_heads=None):
+        class FakeConfig:
+            model_type = "gemma4_text"
+            num_attention_heads = 8
+            num_hidden_layers = len(head_dims)
+            vocab_size = 262144
+            hidden_size = 1536
+            intermediate_size = 6144
+            hidden_act = "silu"
+            max_position_embeddings = 131072
+            rms_norm_eps = 1e-6
+            rope_theta = 10_000.0
+
+            def __init__(self):
+                layer_kv_heads = kv_heads or [1] * len(head_dims)
+                self.per_layer_config = [
+                    type(
+                        "LayerConfig",
+                        (),
+                        {
+                            "head_dim": head_dim,
+                            "num_key_value_heads": num_kv_heads,
+                        },
+                    )()
+                    for head_dim, num_kv_heads in zip(head_dims, layer_kv_heads, strict=True)
+                ]
+                self.layer_types = layer_types
+
+            @property
+            def head_dim(self):
+                raise RuntimeError("global per-layer attribute access is ambiguous")
+
+            @property
+            def num_key_value_heads(self):
+                raise RuntimeError("global per-layer attribute access is ambiguous")
+
+        return FakeConfig()
+
+    def test_uniform_per_layer_head_dim_avoids_ambiguous_global_access(self):
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config.from_transformers(self._heterogeneous_config(256, 256))
+
+        assert config.head_dim == 256
+
+    def test_heterogeneous_per_layer_head_dim_fails_loudly(self):
+        from mobius._configs import Gemma4Config
+
+        with pytest.raises(ValueError, match="heterogeneous per-layer head_dim"):
+            Gemma4Config.from_transformers(self._heterogeneous_config(128, 256))
+
+    def test_dual_head_dim_maps_sliding_and_full_attention(self):
+        from mobius._configs import Gemma4Config
+
+        config = Gemma4Config.from_transformers(
+            self._heterogeneous_config(
+                256,
+                512,
+                layer_types=["sliding_attention", "full_attention"],
+                kv_heads=[8, 2],
+            )
+        )
+
+        assert config.head_dim == 256
+        assert config.global_head_dim == 512
+        assert config.num_key_value_heads == 8
+        assert config.num_global_key_value_heads == 2
+
+    def test_sparse_per_layer_head_dim_preserves_default(self):
+        from mobius._configs import Gemma4Config
+
+        config = type(
+            "FakeConfig",
+            (),
+            {
+                "model_type": "gemma4_text",
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "num_hidden_layers": 5,
+                "vocab_size": 262144,
+                "hidden_size": 1536,
+                "intermediate_size": 6144,
+                "hidden_act": "silu",
+                "max_position_embeddings": 131072,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 10_000.0,
+                "head_dim": 256,
+                "global_head_dim": 512,
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "per_layer_config": {"04": {"head_dim": 512}},
+            },
+        )()
+
+        result = Gemma4Config.from_transformers(config)
+
+        assert result.head_dim == 256
+        assert result.global_head_dim == 512
+
+    def test_unsupported_third_heterogeneous_layer_type_fails(self):
+        from mobius._configs import Gemma4Config
+
+        with pytest.raises(ValueError, match="heterogeneous per-layer head_dim"):
+            Gemma4Config.from_transformers(
+                self._heterogeneous_config(
+                    256,
+                    512,
+                    128,
+                    layer_types=[
+                        "sliding_attention",
+                        "full_attention",
+                        "window_attention",
+                    ],
+                    kv_heads=[8, 2, 4],
+                )
+            )
+
+    def test_boa_token_id_extracted_from_parent(self):
+        """boa_token_id lives on the parent HF config, not text_config."""
+        from mobius._configs import Gemma4Config
+
+        text_config = type(
+            "TextConfig",
+            (),
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "intermediate_size": 6144,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "vocab_size": 262144,
+                "rms_norm_eps": 1e-6,
+                "hidden_act": "silu",
+                "rope_theta": 10_000.0,
+                "max_position_embeddings": 131072,
+                "bos_token_id": 2,
+                "eos_token_id": 1,
+                "pad_token_id": 0,
+            },
+        )()
+        parent_config = type(
+            "ParentConfig",
+            (),
+            {"boa_token_id": 256000, "model_type": "gemma4"},
+        )()
+
+        config = Gemma4Config.from_transformers(text_config, parent_config=parent_config)
+        assert config.boa_token_id == 256000
+
+    def test_boa_token_id_none_when_absent(self):
+        """boa_token_id defaults to None when parent doesn't have it."""
+        from mobius._configs import Gemma4Config
+
+        text_config = type(
+            "TextConfig",
+            (),
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "intermediate_size": 6144,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 1,
+                "head_dim": 256,
+                "vocab_size": 262144,
+                "rms_norm_eps": 1e-6,
+                "hidden_act": "silu",
+                "rope_theta": 10_000.0,
+                "max_position_embeddings": 131072,
+            },
+        )()
+
+        config = Gemma4Config.from_transformers(text_config)
+        assert config.boa_token_id is None
+
+
+class TestActivationFallbacks:
+    """Tests for hidden_act extraction fallbacks (ff_activation, gelu_activation)."""
+
+    def test_ff_activation_fallback(self):
+        """ff_activation is used when hidden_act is absent (XLNet pattern)."""
+
+        class FakeConfig:
+            model_type = "xlnet"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            ff_activation = "gelu"
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.hidden_act == "gelu"
+
+    def test_gelu_activation_true_fallback(self):
+        """gelu_activation=True maps to 'gelu' (XLM pattern)."""
+
+        class FakeConfig:
+            model_type = "xlm"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            gelu_activation = True
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        assert config.hidden_act == "gelu"
+
+    def test_gelu_activation_false_does_not_set_gelu(self):
+        """gelu_activation=False should not set hidden_act to gelu."""
+
+        class FakeConfig:
+            model_type = "some_model"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 1024
+            head_dim = 32
+            gelu_activation = False
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        # With gelu_activation=False and no other activation attr,
+        # hidden_act should be None (not "gelu")
+        assert config.hidden_act is None
+
+
+class TestImplicitRopeDefaults:
+    """Tests for models in _IMPLICIT_ROPE_DEFAULTS."""
+
+    def test_arctic_gets_rope_config(self):
+        """Arctic (rope_theta=10000, rope_scaling=null) should get RoPE."""
+
+        class FakeConfig:
+            model_type = "arctic"
+            num_attention_heads = 8
+            num_key_value_heads = 8
+            num_hidden_layers = 2
+            vocab_size = 1000
+            hidden_size = 256
+            intermediate_size = 512
+            max_position_embeddings = 4096
+            head_dim = 32
+            hidden_act = "silu"
+            # Arctic has rope_theta=10000 (default) and no rope_scaling
+            rope_theta = 10_000.0
+
+        config = ArchitectureConfig.from_transformers(FakeConfig())
+        # Arctic must get RoPE via _IMPLICIT_ROPE_DEFAULTS
+        assert config.rope_type == "default"
+        assert config.rope_theta == pytest.approx(10_000.0)

@@ -1,0 +1,17 @@
+model_id: "microsoft/phi-1_5"
+model_type: "phi"
+revision: "77aa61eeac94fbf33d492b9f2744c98b42d5b5eb"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "Phi-1.5. Early phi architecture with partial RoPE."

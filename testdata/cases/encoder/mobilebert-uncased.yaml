@@ -1,0 +1,14 @@
+model_id: "google/mobilebert-uncased"
+model_type: "mobilebert"
+revision: "main"
+task_type: "feature-extraction"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "The quick brown fox jumps over the lazy dog."
+
+level: "L4"
+skip_reason: "No safetensors weights on HuggingFace Hub"
+
+notes: "MobileBERT uncased. Knowledge-distilled compact BERT."

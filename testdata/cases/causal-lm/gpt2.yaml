@@ -1,0 +1,17 @@
+model_id: "openai-community/gpt2"
+model_type: "gpt2"
+revision: "607a30d783dfa663caf39e06633721c8d4cfcd7e"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "GPT-2 124M. Absolute positional embeddings, no RoPE."

@@ -1,0 +1,27 @@
+{
+  "model_id": "ibm-fms/Bamba-9B",
+  "prompt": "To explain General Relativity,",
+  "generated_tokens": [
+    55152,
+    1511,
+    279,
+    56203,
+    315,
+    264,
+    23506,
+    11071,
+    13,
+    38891,
+    264,
+    23506,
+    11071,
+    41398,
+    704,
+    10269,
+    13,
+    1442,
+    499,
+    2231
+  ],
+  "generated_text": " Einstein used the analogy of a rubber sheet. Imagine a rubber sheet stretched out flat. If you put"
+}

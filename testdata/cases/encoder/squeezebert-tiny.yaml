@@ -1,0 +1,14 @@
+model_id: "optimum-intel-internal-testing/tiny-random-squeezebert"
+model_type: "squeezebert"
+revision: "main"
+task_type: "feature-extraction"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "The quick brown fox jumps over the lazy dog."
+
+level: "L4"
+
+skip_reason: "Architecture-specific differences from generic BERT (extra embeddings, missing params)."
+notes: "SqueezeBERT tiny random. Grouped conv-based efficient BERT."

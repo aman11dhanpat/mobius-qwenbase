@@ -1,0 +1,379 @@
+# Model Catalog
+
+## Non-generative decision models
+
+Mobius exports `Contrastive-LM/CLM-v0.1-8B` with one `ModelPackage`
+containing its headless Qwen3 encoder, state/action projection heads, and
+scaled-cosine scorer (`CLMModel` + `CLMTask`). The CLM release did **not** pin a
+Qwen3-8B base revision: generic construction records the base as `unpinned`;
+`build_clm_package(..., base_revision=<sha>)` requires the caller's selected
+revision and records it as reproducible provenance.
+
+The v0.1 heads first L2-normalize each selected Qwen embedding, then use depth
+3: input `Linear + GELU`, one
+`Linear + LayerNorm + GELU` hidden block (optionally residual), output
+`Linear`, then L2 normalization. The headless encoder emits the complete
+`token_hidden_states` tensor, contains no vocabulary projection, and has no
+generation-cache inputs or outputs. CLM uses
+last-token pooling, but neither the upstream padding side nor its EOS behavior
+is pinned. Callers must select the last attended position using their
+attention mask (the deterministic `clm_last_token_indices` helper is provided)
+before passing `[items, 4096]` embeddings to either projection head. Mobius
+does not assume that sequence position `-1` is a real token.
+
+`jaredpalmer/kev-4b` similarly exports its headless Qwen3.5 backbone and grouped
+pointer head (`KevModel` + `KevTask`). Its published Qwen3.5 base revision is
+pinned. The backbone package exposes only input IDs, attention/position inputs,
+and token hidden states; KV, convolution, and recurrent generation caches are
+not part of this scoring export. `build_kev_package` accepts a dense state dict
+after the published PEFT
+adapter has been merged. Mobius does not currently merge arbitrary PEFT LoRA
+artifacts into Qwen3.5: passing separate base/adapter mappings fails with an
+actionable instruction to use PEFT `merge_and_unload()` first, rather than
+silently exporting the unadapted base.
+
+The deterministic request adapters in `mobius.models.decision` implement each
+model's verified structured rendering, candidate mapping, stable grouped
+softmax, confidence, and ranking contracts. They require a caller-provided
+tokenizer and local tensors; export and preprocessing do not use an HTTP or
+session API. Checkpoint mapping helpers accept already-deserialized mappings,
+so applications retain control over pickle deserialization. Production build
+helpers validate the complete published checkpoint metadata, exact head key
+sets, tensor shapes, and scalar calibration before constructing any graph.
+Flexible `synthetic_*_checkpoint` helpers are test fixtures and intentionally
+do not pass these production contracts.
+
+The Kev adapter enforces the published 8,192-token causal-row limit, 1–255
+option bounds, and a non-empty question set. Non-strict mode truncates state
+user tokens to 8,191 before adding the state control token; strict mode rejects
+that overflow. Every question remains an independent state-plus-question row;
+`batch_kev_rows` produces padded backbone inputs and matching local
+decide/option indices for the pointer graph. Score confidence is
+`max(0, 1 - Σ pᵢ|i-mode|/(L-1))`, matching the public adapter.
+
+### Decision-model parity tests
+
+`tests/kev_parity_test.py` and `tests/clm_parity_test.py` contain fast synthetic
+ONNX-versus-PyTorch tests that run in the normal CPU test lane:
+
+```bash
+pytest tests/kev_parity_test.py tests/clm_parity_test.py -m "not integration"
+```
+
+The full tests are opt-in because they load the exported FP32 package and its
+reference model on CUDA. Keep user-site packages disabled when the selected
+Conda environment contains the intended ONNX Runtime GPU build.
+
+```bash
+# Pinned KEV base, adapter, preprocessing, hidden-state readouts, pointer head,
+# probabilities, and typed answers.
+PYTHONNOUSERSITE=1 \
+MOBIUS_DECISION_EXPORT_ROOT=/path/to/kev-4b-fp32 \
+MOBIUS_KEV_ALLOW_DOWNLOAD=1 \
+pytest tests/kev_parity_test.py -m integration
+
+# CLM with an explicitly selected Qwen3 revision.
+PYTHONNOUSERSITE=1 \
+CLM_RUN_FULL_PARITY=1 \
+CLM_BASE_REVISION=<immutable-qwen3-revision> \
+MOBIUS_DECISION_EXPORT_ROOT=/path/to/clm-v0.1-8b-fp32 \
+pytest tests/clm_parity_test.py -m integration -k exported_clm
+```
+
+CLM's official serving path remains a separate qualification because upstream
+did not pin Qwen3, vLLM, or tokenizer/pooling versions. Start and record an
+external `vllm serve ... --runner pooling` instance, then set
+`CLM_RUN_VLLM_PARITY=1`, `CLM_EMBED_URL`, `CLM_EMBED_MODEL`, and
+`CLM_VLLM_METADATA` to compare its normalized embeddings and probabilities
+against the same exported package.
+
+This user-facing catalog groups registered HuggingFace model types by task and lists
+their module classes and example model IDs. Diffusers pipeline components are described
+separately because they are not entries in the model registry. Neither list implies GGUF
+import or runtime support; see the generated
+[GGUF capability and evidence catalog](gguf-capability-catalog.md) for those
+capability-specific verdicts and statistics.
+
+> **Auto-fallback**: Models not explicitly registered but architecturally
+> compatible with Llama (standard CausalLM transformers) are automatically
+> supported via fallback detection. MoE variants are also auto-detected.
+
+## Decoder-Only LLMs (RoPE)
+
+Standard autoregressive language models using rotary position embeddings.
+
+| Model Type | Module Class | Example HuggingFace Model |
+|---|---|---|
+| `llama` | `CausalLMModel` | `meta-llama/Llama-3.2-1B` |
+| `mistral` | `CausalLMModel` | `mistralai/Mistral-7B-v0.3` |
+| `qwen2` | `CausalLMModel` | `Qwen/Qwen2.5-7B` |
+| `qwen3` | `Qwen3CausalLMModel` | `Qwen/Qwen3-8B` |
+| `gemma` | `GemmaCausalLMModel` | `google/gemma-7b` |
+| `gemma2` | `Gemma2CausalLMModel` | `google/gemma-2-9b` |
+| `gemma3` | `Gemma3CausalLMModel` | `google/gemma-3-4b-pt` |
+| `gemma3_text` | `Gemma3CausalLMModel` | `google/gemma-3-4b-pt` |
+| `gemma3n` | `Gemma3nCausalLMModel` | — |
+| `gemma3n_text` | `Gemma3nCausalLMModel` | — |
+| `phi` | `PhiCausalLMModel` | `microsoft/phi-2` |
+| `phi3` | `Phi3CausalLMModel` | `microsoft/Phi-3-mini-4k-instruct` |
+| `phi3small` | `Phi3SmallCausalLMModel` | `microsoft/Phi-3-small-8k-instruct` |
+| `smollm3` | `SmolLM3CausalLMModel` | `HuggingFaceTB/SmolLM3-3B` |
+| `qwen3_5_text` | `Qwen35CausalLMModel` | `Qwen/Qwen3.5-2B` |
+| `falcon` | `FalconCausalLMModel` | `tiiuae/falcon-7b` |
+| `bloom` | `FalconCausalLMModel` | `bigscience/bloom-560m` |
+| `mpt` | `FalconCausalLMModel` | `mosaicml/mpt-7b` |
+| `chatglm` | `ChatGLMCausalLMModel` | `THUDM/chatglm3-6b` |
+| `internlm2` | `InternLM2CausalLMModel` | `internlm/internlm2-7b` |
+| `granite` | `GraniteCausalLMModel` | `ibm-granite/granite-3b-code-base` |
+| `nemotron` | `NemotronCausalLMModel` | `nvidia/Nemotron-4-340B-Base` |
+| `olmo` | `OLMoCausalLMModel` | `allenai/OLMo-7B` |
+| `olmo2` | `OLMo2CausalLMModel` | `allenai/OLMo-2-7B` |
+| `olmo3` | `OLMo2CausalLMModel` | `allenai/OLMo-3-8B` |
+| `ernie4_5` | `ErnieCausalLMModel` | — |
+| `cohere` | `CausalLMModel` | `CohereForAI/c4ai-command-r-v01` |
+| `cohere2` | `CausalLMModel` | `CohereForAI/c4ai-command-r7b-12-2024` |
+| `modernbert-decoder` | `ModernBertDecoderModel` | — |
+
+Also registered with `CausalLMModel`: `apertus`, `arcee`, `baichuan`,
+`code_llama`, `codegen`, `codegen2`, `command_r`, `csm`, `diffllama`,
+`doge`, `dots1`, `evolla`, `exaone`, `exaone4`, `glm`, `glm4`,
+`gpt_neox`, `gpt_neox_japanese`, `gptj`, `helium`, `hunyuan_v1_dense`,
+`llama4_text`, `longcat_flash`, `minicpm`, `minicpm3`, `ministral`,
+`ministral3`, `mistral3`, `nanochat`, `open-llama`, `openelm`,
+`persimmon`, `seed_oss`, `solar_open`, `stablelm`, `starcoder2`, `yi`,
+`youtu`, `zamba`, `zamba2`.
+
+## Decoder-Only LLMs (Absolute Position Embeddings)
+
+GPT-2 style models using learned absolute positional embeddings.
+
+| Model Type | Module Class | Example HuggingFace Model |
+|---|---|---|
+| `gpt2` | `GPT2CausalLMModel` | `openai-community/gpt2` |
+| `opt` | `OPTCausalLMModel` | `facebook/opt-1.3b` |
+
+Also registered with `GPT2CausalLMModel`: `biogpt`, `ctrl`, `gpt-sw3`,
+`gpt_bigcode`, `gpt_neo`, `imagegpt`, `openai-gpt`, `xglm`, `xlm`.
+
+## Mixture-of-Experts (MoE)
+
+Models that route tokens to a subset of expert MLPs.
+
+| Model Type | Module Class | Example HuggingFace Model |
+|---|---|---|
+| `mixtral` | `MoECausalLMModel` | `mistralai/Mixtral-8x7B-v0.1` |
+| `qwen2_moe` | `MoECausalLMModel` | `Qwen/Qwen1.5-MoE-A2.7B` |
+| `qwen3_moe` | `MoECausalLMModel` | `Qwen/Qwen3-30B-A3B` |
+| `qwen3_5_moe` | `Qwen35MoECausalLMModel` | — |
+| `qwen3_next` | `Qwen3NextCausalLMModel` | — |
+| `deepseek_v2` | `DeepSeekV3CausalLMModel` | `deepseek-ai/DeepSeek-V2-Lite` |
+| `deepseek_v3` | `DeepSeekV3CausalLMModel` | `deepseek-ai/DeepSeek-V3` |
+| `phimoe` | `Phi3MoECausalLMModel` | `microsoft/Phi-3.5-MoE-instruct` |
+| `gpt_oss` | `GPTOSSCausalLMModel` | `openai/gpt-oss-20b` (native MXFP4/QMoE on CUDA) |
+
+Also registered with `MoECausalLMModel`: `arctic`, `dbrx`,
+`ernie4_5_moe`, `flex_olmo`, `glm4_moe`, `granitemoe`,
+`granitemoehybrid`, `granitemoeshared`, `hunyuan_v1_moe`, `jetmoe`,
+`minimax`, `olmoe`, `qwen3_omni_moe`, `qwen3_vl_moe`.
+
+## SSM / State-Space Models
+
+Mamba and Mamba2 architectures using selective state-space layers.
+
+| Model Type | Module Class | Task | Example HuggingFace Model |
+|---|---|---|---|
+| `mamba` | `MambaCausalLMModel` | `ssm-text-generation` | `state-spaces/mamba-2.8b` |
+| `falcon_mamba` | `MambaCausalLMModel` | `ssm-text-generation` | `tiiuae/falcon-mamba-7b` |
+| `mamba2` | `Mamba2CausalLMModel` | `ssm2-text-generation` | `state-spaces/mamba2-2.7b` |
+
+## Hybrid SSM+Attention
+
+Models combining Mamba/SSM layers with transformer attention layers.
+
+| Model Type | Module Class | Task | Example HuggingFace Model |
+|---|---|---|---|
+| `jamba` | `JambaCausalLMModel` | `hybrid-text-generation` | `ai21labs/Jamba-v0.1` |
+| `bamba` | `BambaCausalLMModel` | `hybrid-text-generation` | `ibm-fms/Bamba-9B` |
+
+## Vision-Language (Multimodal)
+
+Models that process both images and text.
+
+For Gemma4 26B-A4B, see the [draft runtime qualification and FP32 pixel input
+contract](gemma4-runtime.md), including the failed strict parity gate and limits
+of the prior evaluation evidence.
+
+| Model Type | Module Class | Task | Example HuggingFace Model |
+|---|---|---|---|
+| `llava` | `LLaVAModel` | `vision-language` | `llava-hf/llava-1.5-7b-hf` |
+| `llava_next` | `LLaVAModel` | `vision-language` | `llava-hf/llava-v1.6-mistral-7b-hf` |
+| `qwen2_vl` | `Qwen25VLCausalLMModel` | `qwen-vl` | `Qwen/Qwen2-VL-7B-Instruct` |
+| `qwen2_5_vl` | `Qwen25VLCausalLMModel` | `qwen-vl` | `Qwen/Qwen2.5-VL-3B-Instruct` |
+| `qwen3_vl` | `Qwen3VL3ModelCausalLMModel` | `qwen-vl` | `Qwen/Qwen3-VL-2B-Instruct` |
+| `qwen3_5_vl` | `Qwen35VL3ModelCausalLMModel` | `hybrid-qwen-vl` | `Qwen/Qwen3.5-2B`, `Qwen/Qwen3.6-27B` |
+| `gemma3_multimodal` | `Gemma3MultiModalModel` | `vision-language` | `google/gemma-3-4b-it` |
+| `mllama` | `MllamaCausalLMModel` | `mllama-vision-language` | `meta-llama/Llama-3.2-11B-Vision` |
+| `phi4mm` | `Phi4MMMultiModalModel` | `multimodal` | `microsoft/Phi-4-multimodal-instruct` |
+| `phi4_multimodal` | `Phi4MMMultiModalModel` | `multimodal` | `microsoft/Phi-4-multimodal-instruct` |
+| `blip-2` | `Blip2Model` | `vision-language` | `Salesforce/blip2-opt-2.7b` |
+| `internvl2` | `InternVL2Model` | `vision-language` | `OpenGVLab/InternVL2-8B` |
+| `deepseek_vl_v2` | `DeepSeekOCR2CausalLMModel` | `vision-language` | — |
+
+Also registered with `LLaVAModel` (task: `vision-language`):
+`aya_vision`, `chameleon`, `cohere2_vision`, `deepseek_vl`,
+`deepseek_vl_hybrid`, `florence2`, `fuyu`, `glm4v`, `glm4v_moe`,
+`got_ocr2`, `idefics2`, `idefics3`, `instructblip`,
+`instructblipvideo`, `janus`, `llava_next_video`, `llava_onevision`,
+`molmo`, `ovis2`, `paligemma`, `pixtral`, `smolvlm`, `video_llava`,
+`vipllava`.
+
+## Encoder-Only (BERT Family)
+
+Models for text embeddings, classification, and feature extraction.
+
+| Model Type | Module Class | Task | Example HuggingFace Model |
+|---|---|---|---|
+| `bert` | `BertModel` | `feature-extraction` | `google-bert/bert-base-uncased` |
+| `roberta` | `BertModel` | `feature-extraction` | `FacebookAI/roberta-base` |
+| `distilbert` | `DistilBertModel` | `feature-extraction` | `distilbert/distilbert-base-uncased` |
+| `modernbert` | `ModernBertModel` | `feature-extraction` | `answerdotai/ModernBERT-base` |
+| `layoutlmv3` | `LayoutLMv3Model` | `feature-extraction` | `microsoft/layoutlmv3-base` |
+| `clip_text_model` | `CLIPTextModel` | `feature-extraction` | — |
+
+Also registered with `BertModel` (task: `feature-extraction`):
+`albert`, `camembert`, `data2vec-text`, `deberta`, `deberta-v2`,
+`electra`, `ernie`, `ernie_m`, `esm`, `flaubert`, `ibert`,
+`megatron-bert`, `mobilebert`, `mpnet`, `nezha`, `qdqbert`, `rembert`,
+`roberta-prelayernorm`, `roc_bert`, `roformer`, `splinter`,
+`squeezebert`, `xlm-roberta`, `xlm-roberta-xl`, `xlnet`, `xmod`,
+`bros`, `layoutlm`, `layoutlmv2`, `lilt`, `markuplm`, `mega`, `mra`,
+`nystromformer`, `yoso`.
+
+## Encoder-Decoder (Seq2Seq)
+
+Sequence-to-sequence models for translation, summarization, etc.
+
+| Model Type | Module Class | Task | Example HuggingFace Model |
+|---|---|---|---|
+| `bart` | `BartForConditionalGeneration` | `seq2seq` | `facebook/bart-large` |
+| `t5` | `T5ForConditionalGeneration` | `seq2seq` | `google-t5/t5-small` |
+| `mt5` | `T5ForConditionalGeneration` | `seq2seq` | `google/mt5-small` |
+| `mbart` | `BartForConditionalGeneration` | `seq2seq` | `facebook/mbart-large-50` |
+| `trocr` | `TrOCRForConditionalGeneration` | `seq2seq` | `microsoft/trocr-base-handwritten` |
+
+Also registered with `BartForConditionalGeneration` (task: `seq2seq`):
+`bigbird_pegasus`, `blenderbot`, `blenderbot-small`, `fsmt`, `led`,
+`m2m_100`, `marian`, `mvp`, `nllb-moe`, `nllb_moe`, `pegasus`,
+`pegasus_x`, `plbart`, `prophetnet`, `xlm-prophetnet`.
+
+Also registered with `T5ForConditionalGeneration` (task: `seq2seq`):
+`longt5`, `switch_transformers`, `umt5`.
+
+## Speech & Audio
+
+### Speech-to-Text
+
+| Model Type | Module Class | Task | Example HuggingFace Model |
+|---|---|---|---|
+| `whisper` | `WhisperForConditionalGeneration` | `speech-to-text` | `openai/whisper-tiny` |
+| `moonshine` | `MoonshineForConditionalGeneration` | `speech-to-text` | `UsefulSensors/moonshine-tiny` |
+| `moonshine_streaming` | `MoonshineStreamingForConditionalGeneration` | `speech-to-text` | `moonshine-ai/moonshine-streaming-tiny` |
+| `qwen3_asr` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
+| `qwen3_forced_aligner` | `Qwen3ASRForConditionalGeneration` | `speech-language` | — |
+| `VibeVoiceForASRStreamingTraining` | `VibeVoiceASRStreamingForConditionalGeneration` | `vibevoice-asr-streaming` | `microsoft/VibeVoice-ASR-Streaming-1.5B`, `microsoft/VibeVoice-ASR-Streaming-7B` |
+
+### Text-to-Speech
+
+| Model Type | Module Class | Task | Example HuggingFace Model |
+|---|---|---|---|
+| `qwen3_tts` | `Qwen3TTSForConditionalGeneration` | `tts` | — |
+| `qwen3_tts_tokenizer_12hz` | `Qwen3TTSTokenizerV2Model` | `codec` | — |
+| `vibevoice` | `VibeVoiceForConditionalGeneration` | `vibevoice-tts` | `vibevoice/VibeVoice-1.5B-hf` |
+| `vibevoice_asr` | `VibeVoiceASRForConditionalGeneration` | `vibevoice-asr` | `microsoft/VibeVoice-ASR-HF` |
+
+### Audio Feature Extraction
+
+| Model Type | Module Class | Task | Example HuggingFace Model |
+|---|---|---|---|
+| `wav2vec2` | `Wav2Vec2Model` | `audio-feature-extraction` | `facebook/wav2vec2-base` |
+| `hubert` | `Wav2Vec2Model` | `audio-feature-extraction` | `facebook/hubert-base-ls960` |
+| `wavlm` | `Wav2Vec2Model` | `audio-feature-extraction` | `microsoft/wavlm-base` |
+
+Also registered with `Wav2Vec2Model`: `data2vec-audio`, `mctct`,
+`musicgen`, `seamless_m4t`, `seamless_m4t_v2`, `sew`, `sew-d`,
+`speecht5`, `unispeech`, `unispeech-sat`, `voxtral_encoder`,
+`wav2vec2-bert`, `wav2vec2-conformer`.
+
+## Vision
+
+### Image Classification & Feature Extraction
+
+| Model Type | Module Class | Task | Example HuggingFace Model |
+|---|---|---|---|
+| `vit` | `ViTModel` | `image-classification` | `google/vit-base-patch16-224` |
+| `clip_vision_model` | `CLIPVisionModel` | `image-classification` | — |
+| `siglip_vision_model` | `CLIPVisionModel` | `image-classification` | — |
+| `blip` | `BlipVisionModel` | `image-classification` | — |
+| `depth_anything` | `DepthAnythingForDepthEstimation` | `image-classification` | `LiheYoung/depth-anything-base-hf` |
+| `sam2` | `Sam2VisionModel` | `image-classification` | `facebook/sam2-hiera-large` |
+| `segformer` | `SegformerForSemanticSegmentation` | `image-classification` | `nvidia/segformer-b0-finetuned-ade-512-512` |
+| `yolos` | `YolosForObjectDetection` | `object-detection` | `hustvl/yolos-tiny` |
+
+Also registered with `ViTModel`: `beit`, `cvt`, `data2vec-vision`,
+`deit`, `dinov2`, `dinov2_with_registers`, `dinov3_vit`, `hiera`,
+`ijepa`, `mobilevit`, `mobilevitv2`, `pvt`, `pvt_v2`, `swin`,
+`swin2sr`, `swinv2`, `vit_hybrid`, `vit_mae`, `vit_msn`.
+
+## Diffusion (via Diffusers)
+
+Diffusion models are built through the `build_diffusers_pipeline()` API
+which auto-detects the pipeline type from HuggingFace. These are not
+registered in the model registry but are supported as diffusers pipeline
+components.
+
+Supported component classes include:
+
+- `UNet2DConditionModel` — Stable Diffusion, SDXL UNet
+- `AutoencoderKLModel` — VAE encoder/decoder
+- `FluxTransformer2DModel` — Flux transformer
+- `SD3Transformer2DModel` — Stable Diffusion 3 transformer
+- `DiTTransformer2DModel` — DiT (Diffusion Transformer)
+- `HunyuanDiT2DModel` — Hunyuan-DiT
+- `ControlNetModel` — ControlNet conditioning
+- `CogVideoXTransformer3DModel` — CogVideoX
+- `VideoAutoencoderModel` — Video VAE
+- `QwenImageTransformer2DModel` — Qwen image generation and packed-token
+  Qwen-Image-Edit-2509 denoising with source-image conditioning, masks, and 3D RoPE
+- `AutoencoderKLQwenImageModel` — Qwen image VAE, including edit-pipeline latent
+  normalization
+- `Qwen2_5_VLForConditionalGeneration` — image-aware prompt encoder used by
+  Qwen-Image-Edit-2509
+
+```python
+from mobius import build
+
+# Auto-detect diffusers pipeline
+pkg = build("stabilityai/stable-diffusion-xl-base-1.0")
+```
+
+## Quantization Support
+
+All decoder-only LLMs and MoE models support quantized weight loading:
+
+| Format | Source | How |
+|---|---|---|
+| **GPTQ** | HuggingFace (e.g. `-GPTQ` suffix models) | `build("TheBloke/Llama-2-7B-GPTQ")` |
+| **AWQ** | HuggingFace (e.g. `-AWQ` suffix models) | `build("TheBloke/Llama-2-7B-AWQ")` |
+| **GGUF** | Local `.gguf` files | `build_from_gguf("model.gguf")` |
+
+GGUF import uses quantized target storage by default where the selected graph
+supports it. Source blocks may be byte-preserved, losslessly repacked, or
+lossily dequantized/requantized to a target such as INT4 affine block-32.
+Lossy conversion emits one aggregate warning, and every saved package records
+source fidelity, storage, and compute semantics in `quantization_report.json`.
+Use `--dequantize` for an explicitly reported float model.
+
+Encoder GGUF imports for `bert` and `modern-bert` select
+`feature-extraction` and expose token-level `last_hidden_state` only. Pooling,
+classifier/reranker heads, generative task overrides, and cache options are
+rejected unless their exact output contracts are implemented.

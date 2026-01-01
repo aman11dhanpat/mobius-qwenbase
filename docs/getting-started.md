@@ -1,0 +1,286 @@
+# Getting Started
+
+**mobius** generates ONNX models for common GenAI architectures
+(LLMs, MoE, multimodal, speech-to-text, encoder-only, encoder-decoder, vision,
+audio, and diffusion) built directly as ONNX graphs using
+`onnxscript.nn.Module`. It supports building from HuggingFace model IDs with
+automatic weight downloading and conversion, including bfloat16 models via
+`ir.LazyTensor`-based dtype casting.
+
+📦 [GitHub Repository](https://github.com/onnxruntime/mobius)
+
+## Installation
+
+```bash
+pip install mobius-onnx
+```
+
+For development and testing:
+
+```bash
+pip install -e ".[testing]"
+```
+
+### Dependencies
+
+- **Required**: `onnxscript`, `onnx_ir`, `numpy`, `torch`, `huggingface_hub`, `tqdm`
+- **Optional (transformers)**: `transformers`, `safetensors` — for building from HuggingFace model IDs
+- **Optional (gguf)**: `gguf` — for building from GGUF files
+- **Optional (testing)**: `onnxruntime-easy`, `transformers`, `safetensors` — for running tests
+
+## Quick Start
+
+### Build from a HuggingFace model ID
+
+```python
+from mobius import build
+
+pkg = build("meta-llama/Llama-3.2-1B")
+pkg.save("output/llama-3.2-1b/")
+```
+
+### Build from a custom module
+
+```python
+from mobius import build_from_module
+from mobius._configs import ArchitectureConfig
+from mobius.models.base import CausalLMModel
+
+config = ArchitectureConfig(
+    vocab_size=32000,
+    max_position_embeddings=4096,
+    hidden_size=4096,
+    intermediate_size=11008,
+    num_hidden_layers=32,
+    num_attention_heads=32,
+    num_key_value_heads=32,
+    hidden_act="silu",
+    head_dim=128,
+    pad_token_id=0,
+)
+
+model = build_from_module(CausalLMModel(config), config)
+model["model"]  # ir.Model
+```
+
+### Build a multi-component model
+
+Models with multiple components (e.g. encoder + decoder, or vision + text)
+can be exported as a package:
+
+```python
+from mobius import build
+
+pkg = build("openai/whisper-tiny")
+pkg.save("/output/whisper/")
+# Produces encoder.onnx and decoder.onnx
+```
+
+### Build different model types
+
+```python
+from mobius import build
+
+# Encoder-only (BERT)
+pkg = build("bert-base-uncased")
+
+# Encoder-decoder (T5)
+pkg = build("google-t5/t5-small")
+
+# Multimodal (LLaVA)
+pkg = build("llava-hf/llava-1.5-7b-hf")
+
+# Audio encoder (Wav2Vec2)
+pkg = build("facebook/wav2vec2-base")
+```
+
+### Build from a GGUF file
+
+Convert a GGUF model (e.g. from llama.cpp) to ONNX. Quantized target storage is
+used by default where the selected graph supports it:
+
+```python
+from mobius import build_from_gguf
+
+pkg = build_from_gguf("path/to/model.gguf")
+pkg.save("output/model/")
+```
+
+Or via CLI:
+
+```bash
+mobius build-gguf path/to/model.gguf --output output/model/
+```
+
+Pass `--dequantize` on the CLI, or `keep_quantized=False` to
+`build_from_gguf()`, when a fully float ONNX model is required. F32-, F16-, and
+BF16-only GGUFs automatically use the float path.
+
+`keep_quantized=True` does **not** promise source byte or numerical fidelity.
+Some qtypes are byte-preserved or losslessly repacked, while others are
+dequantized and lossily requantized to a target such as INT4 affine block-32.
+Mobius emits one aggregate warning for lossy conversion and saves the complete
+classification as `quantization_report.json`; do not label normalized output as
+the source GGUF preset (for example, Q4_K_M). The report lists source qtype
+counts/bytes, explicit float tensors, storage fidelity, and compute capability.
+
+Packed storage and runtime compute are separate. A runtime may execute a native
+`MatMulNBits` custom op, or Mobius may inline its portable standard-ONNX
+fallback (nibble `BitShift`/`BitwiseAnd`, `DequantizeLinear`, then float
+`MatMul`). Inlining the fallback does not replace packed weight initializers
+with dense float initializers and does not promise a particular ORT kernel.
+
+> **Note**: GGUF support requires the optional `gguf` package:
+> `pip install mobius-onnx[gguf]`
+
+### Build quantized models (GPTQ/AWQ)
+
+Quantized HuggingFace models are handled automatically:
+
+```python
+from mobius import build
+
+# GPTQ quantized
+pkg = build("TheBloke/Llama-2-7B-GPTQ")
+
+# AWQ quantized
+pkg = build("TheBloke/Llama-2-7B-AWQ")
+```
+
+### Choose a target dtype
+
+```python
+from mobius import build
+
+# Build with float16 weights
+pkg = build("meta-llama/Llama-3.2-1B", dtype="f16")
+
+# Build with bfloat16 weights
+pkg = build("meta-llama/Llama-3.2-1B", dtype="bf16")
+```
+
+### Extensibility
+
+Register custom architectures or tasks:
+
+```python
+from mobius import registry
+from mobius.tasks import TASK_REGISTRY
+
+registry.register("my_arch", MyCustomModel)
+TASK_REGISTRY["my-task"] = MyCustomTask
+```
+
+### Load config from a local directory
+
+```python
+from mobius import ArchitectureConfig
+
+config = ArchitectureConfig.from_file("/path/to/model/")
+config.validate()  # Check field consistency
+```
+
+### Apply graph optimizations
+
+```python
+from onnxscript.rewriter import rewrite
+from mobius import build
+from mobius.rewrite_rules import group_query_attention_rules, skip_norm_rules
+
+pkg = build("Qwen/Qwen2.5-0.5B")
+model = pkg["model"]
+rewrite(model, pattern_rewrite_rules=group_query_attention_rules())
+rewrite(model, pattern_rewrite_rules=skip_norm_rules())
+```
+
+Or via CLI:
+
+```bash
+mobius build --model Qwen/Qwen2.5-0.5B --output output/ --ep cuda --dtype f16
+```
+
+## CLI Quick Start
+
+```bash
+# Basic build
+mobius build --model meta-llama/Llama-3.2-1B --output output/
+
+# Build for CUDA with f16
+mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep cuda --dtype f16
+
+# Build for ORT GenAI runtime
+mobius build --model meta-llama/Llama-3.2-1B --output output/ --ep cuda --dtype f16 --runtime ort-genai
+```
+
+The `mobius` CLI has these subcommands:
+
+- **`build`** — Build an ONNX model from a HuggingFace model ID or local config.
+- **`build-gguf`** — Convert a GGUF file to ONNX.
+- **`list`** — List supported models, tasks, dtypes, or execution providers.
+- **`info`** — Inspect a model without building it.
+
+For the full CLI reference including all flags, execution providers, and
+optimization options, see [CLI Reference](cli_reference.md).
+
+### Adding a new model
+
+See the [adding-a-new-model skill](../.agents/skills/adding-a-new-model/SKILL.md)
+for copy-paste examples and step-by-step instructions.
+
+## Output Format
+
+### ModelPackage
+
+`build()` and `build_from_module()` return a `ModelPackage` — a dict-like
+collection of named `ir.Model` objects.
+
+- **Single-model tasks** (e.g. CausalLM): `pkg["model"]`
+- **Multi-model tasks** (e.g. VLM): `pkg["model"]`, `pkg["vision"]`, `pkg["embedding"]`
+- **Encoder-decoder**: `pkg["encoder"]`, `pkg["decoder"]`
+
+### Saving to disk
+
+```python
+pkg.save("output/")
+# Single model: output/model.onnx + output/model.onnx.data
+# Multi model: output/model/model.onnx, output/vision/model.onnx, ...
+```
+
+Safetensors format:
+```python
+pkg.save("output/", external_data="safetensors")
+```
+
+### Discover supported models
+
+```bash
+# List all supported architectures
+mobius list models
+
+# Inspect a specific model
+mobius info meta-llama/Llama-3.2-1B
+```
+
+## Development
+
+### Running tests
+
+```bash
+# Unit tests (fast, no network needed)
+pytest tests/build_graph -v
+
+# Run a single model type
+pytest tests/build_graph -k "phi4mm"
+
+# Integration tests (downloads models, requires more time/memory)
+pytest tests/integration -m integration -v
+
+# Run a single integration test model
+pytest tests/integration/text_test.py -m integration -k "qwen2.5-0.5b"
+```
+
+### Linting
+
+```bash
+lintrunner f --all-files
+```

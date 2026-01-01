@@ -1,0 +1,14 @@
+model_id: "optimum-intel-internal-testing/tiny-random-NystromformerModel"
+model_type: "nystromformer"
+revision: "main"
+task_type: "feature-extraction"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "The quick brown fox jumps over the lazy dog."
+
+level: "L4"
+skip_reason: "No safetensors weights on HuggingFace Hub"
+
+notes: "Nyströmformer tiny random. Nyström approximation attention."

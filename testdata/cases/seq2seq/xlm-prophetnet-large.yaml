@@ -1,0 +1,15 @@
+model_id: "microsoft/xprophetnet-large-wiki100-cased"
+model_type: "xlm-prophetnet"
+revision: "main"
+task_type: "seq2seq"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "summarize: The tower is 324 metres tall and is the tallest structure in Paris."
+  decoder_prompt: ""
+
+level: "L4"
+
+notes: "XLM-ProphetNet large. Multilingual future n-gram prediction."
+skip_reason: "Tokenizer backend instantiation fails in current transformers."

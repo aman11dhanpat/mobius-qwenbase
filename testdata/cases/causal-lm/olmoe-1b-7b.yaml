@@ -1,0 +1,17 @@
+model_id: "allenai/OLMoE-1B-7B-0924"
+model_type: "olmoe"
+revision: "main"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "OLMoE 1B-7B. Open Mixture-of-Experts from Allen AI."

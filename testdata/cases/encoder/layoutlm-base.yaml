@@ -1,0 +1,14 @@
+model_id: "microsoft/layoutlm-base-uncased"
+model_type: "layoutlm"
+revision: "main"
+task_type: "feature-extraction"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "The quick brown fox jumps over the lazy dog."
+
+level: "L4"
+
+skip_reason: "Architecture-specific differences from generic BERT (extra embeddings, missing params)."
+notes: "LayoutLM base. Document layout + text encoder."

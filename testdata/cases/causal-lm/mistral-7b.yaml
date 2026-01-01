@@ -1,0 +1,17 @@
+model_id: "mistralai/Mistral-7B-v0.1"
+model_type: "mistral"
+revision: "27d67f1b5f57dc0953326b2601d68371d40ea8da"
+task_type: "text-generation"
+dtype: "float32"
+
+inputs:
+  prompts:
+    - "Here is my poem:"
+
+level: "L4+L5"
+
+generation:
+  max_new_tokens: 20
+  do_sample: false
+
+notes: "Mistral 7B. Sliding window attention, grouped-query attention."

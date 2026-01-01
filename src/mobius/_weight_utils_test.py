@@ -1,0 +1,1646 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Tests for _weight_utils.py — shared weight preprocessing utilities."""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+
+from mobius._configs import QuantizationConfig
+from mobius._weight_utils import (
+    is_packed_quant_key,
+    materialize_split_tied_olive_lm_head,
+    merge_lora_weights,
+    preprocess_awq_weights,
+    preprocess_gptq_weights,
+    preprocess_olive_weights,
+    preprocess_quantized_weights,
+    rename_weight_keys,
+    split_codegen_qkv,
+    split_fused_qkv,
+    split_gate_up_proj,
+    split_interleaved_qkv,
+    stack_per_expert_moe_weights,
+    strip_prefix,
+    tie_word_embeddings,
+    vlm_decoder_weights,
+    vlm_embedding_weights,
+    vlm_vision_weights,
+)
+
+
+@pytest.mark.parametrize(
+    ("case", "error", "message"),
+    [
+        ("float_head", NotImplementedError, "requires quantize_lm_head=True"),
+        ("different_layout", ValueError, "must use the same quantization layout"),
+        ("missing_scales", ValueError, "missing Olive sidecars"),
+    ],
+)
+def test_split_tied_table_rejects_unsupported_materialization(case, error, message):
+    embedding = QuantizationConfig(
+        bits=4, group_size=16, quant_method="olive", quantize_embeddings=True
+    )
+    head = QuantizationConfig(
+        bits=4, group_size=16, quant_method="olive", quantize_lm_head=True
+    )
+    state_dict = {
+        "embedding.embed_tokens.weight_qweight": torch.zeros(32, 8, dtype=torch.uint8),
+        "embedding.embed_tokens.weight_scales": torch.ones(32, 1),
+    }
+    if case == "float_head":
+        head.quantize_lm_head = False
+    elif case == "different_layout":
+        head.bits = 8
+    else:
+        del state_dict["embedding.embed_tokens.weight_scales"]
+
+    with pytest.raises(error, match=message):
+        materialize_split_tied_olive_lm_head(
+            state_dict,
+            embed_key="embedding.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+            embedding_quantization=embedding,
+            head_quantization=head,
+        )
+    assert "decoder.lm_head.weight_qweight" not in state_dict
+
+
+class TestSplitFusedQKV:
+    """Tests for split_fused_qkv."""
+
+    def test_mha_equal_heads(self):
+        """MHA: num_heads == num_kv_heads, all sizes equal."""
+        num_heads = 4
+        num_kv_heads = 4
+        head_dim = 8
+        hidden = 16
+        total = (num_heads + 2 * num_kv_heads) * head_dim
+        weight = torch.arange(total * hidden).reshape(total, hidden).float()
+
+        q, k, v = split_fused_qkv(weight, num_heads, num_kv_heads, head_dim)
+
+        assert q.shape == (num_heads * head_dim, hidden)
+        assert k.shape == (num_kv_heads * head_dim, hidden)
+        assert v.shape == (num_kv_heads * head_dim, hidden)
+        # Values are contiguous slices of the original
+        torch.testing.assert_close(q, weight[: num_heads * head_dim])
+
+    def test_gqa_fewer_kv_heads(self):
+        """GQA: num_kv_heads < num_heads."""
+        num_heads = 8
+        num_kv_heads = 2
+        head_dim = 4
+        q_size = num_heads * head_dim  # 32
+        kv_size = num_kv_heads * head_dim  # 8
+        total = q_size + 2 * kv_size  # 48
+        weight = torch.randn(total)
+
+        q, k, v = split_fused_qkv(weight, num_heads, num_kv_heads, head_dim)
+
+        assert q.shape == (q_size,)
+        assert k.shape == (kv_size,)
+        assert v.shape == (kv_size,)
+        # Verify the splits reconstruct the original
+        torch.testing.assert_close(torch.cat([q, k, v]), weight)
+
+    def test_mqa_single_kv_head(self):
+        """MQA: num_kv_heads == 1."""
+        num_heads = 16
+        num_kv_heads = 1
+        head_dim = 64
+        hidden = 32
+        total = (num_heads + 2) * head_dim
+        weight = torch.randn(total, hidden)
+
+        q, k, v = split_fused_qkv(weight, num_heads, num_kv_heads, head_dim)
+
+        assert q.shape == (num_heads * head_dim, hidden)
+        assert k.shape == (head_dim, hidden)
+        assert v.shape == (head_dim, hidden)
+
+    def test_splits_are_views(self):
+        """Splits should be views of the original tensor (no copy)."""
+        weight = torch.randn(32, 16)
+        q, _k, _v = split_fused_qkv(weight, 4, 2, 4)
+        assert q.data_ptr() == weight.data_ptr()
+
+    def test_1d_bias_tensor(self):
+        """Works with 1D bias tensors too."""
+        # num_heads=4, num_kv_heads=2, head_dim=4 → total = 16+8+8 = 32
+        bias = torch.randn(32)
+        q, k, v = split_fused_qkv(bias, 4, 2, 4)
+        assert q.shape == (16,)
+        assert k.shape == (8,)
+        assert v.shape == (8,)
+
+
+class TestSplitGateUpProj:
+    """Tests for split_gate_up_proj."""
+
+    def test_basic_split(self):
+        """Splits a 2D weight at intermediate_size."""
+        intermediate_size = 64
+        hidden = 32
+        weight = torch.randn(2 * intermediate_size, hidden)
+
+        gate, up = split_gate_up_proj(weight, intermediate_size)
+
+        assert gate.shape == (intermediate_size, hidden)
+        assert up.shape == (intermediate_size, hidden)
+        torch.testing.assert_close(torch.cat([gate, up]), weight)
+
+    def test_1d_bias(self):
+        """Works with 1D bias tensors."""
+        intermediate_size = 128
+        bias = torch.randn(2 * intermediate_size)
+
+        gate, up = split_gate_up_proj(bias, intermediate_size)
+
+        assert gate.shape == (intermediate_size,)
+        assert up.shape == (intermediate_size,)
+
+    def test_splits_are_views(self):
+        """Splits should be views of the original tensor."""
+        weight = torch.randn(256, 64)
+        gate, _up = split_gate_up_proj(weight, 128)
+        assert gate.data_ptr() == weight.data_ptr()
+
+
+class TestStripPrefix:
+    """Tests for strip_prefix."""
+
+    def test_strips_prefix(self):
+        """Basic prefix stripping."""
+        state_dict = {
+            "model.layers.0.weight": torch.tensor(1.0),
+            "model.layers.1.weight": torch.tensor(2.0),
+            "model.embed.weight": torch.tensor(3.0),
+        }
+        result = strip_prefix(state_dict, "model")
+        assert set(result.keys()) == {
+            "layers.0.weight",
+            "layers.1.weight",
+            "embed.weight",
+        }
+
+    def test_drops_non_matching_keys(self):
+        """Keys without the prefix are excluded."""
+        state_dict = {
+            "model.weight": torch.tensor(1.0),
+            "other.weight": torch.tensor(2.0),
+        }
+        result = strip_prefix(state_dict, "model")
+        assert list(result.keys()) == ["weight"]
+
+    def test_trailing_dot_optional(self):
+        """Prefix with or without trailing dot gives same result."""
+        state_dict = {"foo.bar": torch.tensor(1.0)}
+        result_no_dot = strip_prefix(state_dict, "foo")
+        result_with_dot = strip_prefix(state_dict, "foo.")
+        assert result_no_dot == result_with_dot
+
+    def test_empty_state_dict(self):
+        """Empty input returns empty output."""
+        result = strip_prefix({}, "model")
+        assert result == {}
+
+    def test_preserves_tensor_values(self):
+        """Tensor values are preserved (not copied)."""
+        t = torch.randn(3, 4)
+        result = strip_prefix({"prefix.key": t}, "prefix")
+        assert result["key"].data_ptr() == t.data_ptr()
+
+
+class TestRenameWeightKeys:
+    """Tests for rename_weight_keys."""
+
+    def test_applies_replacements(self):
+        """Each (old, new) pair is applied to every key."""
+        state_dict = {
+            "model.layers.0.attention_layernorm.weight": torch.tensor(1.0),
+            "model.layers.0.feedforward_layernorm.weight": torch.tensor(2.0),
+            "model.embed.weight": torch.tensor(3.0),
+        }
+        result = rename_weight_keys(
+            state_dict,
+            [
+                (".attention_layernorm.", ".input_layernorm."),
+                (".feedforward_layernorm.", ".post_attention_layernorm."),
+            ],
+        )
+        assert set(result.keys()) == {
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.embed.weight",
+        }
+
+    def test_replacements_are_ordered_and_cascade(self):
+        """Replacements apply to the progressively updated key, in order."""
+        state_dict = {"a.weight": torch.tensor(1.0)}
+        result = rename_weight_keys(state_dict, [("a.", "b."), ("b.", "c.")])
+        assert list(result.keys()) == ["c.weight"]
+
+    def test_no_replacements_is_identity(self):
+        """An empty replacement list returns a key-equivalent copy."""
+        state_dict = {"x.weight": torch.tensor(1.0)}
+        result = rename_weight_keys(state_dict, [])
+        assert list(result.keys()) == ["x.weight"]
+        assert result is not state_dict
+
+    def test_shares_tensor_values(self):
+        """Tensor values are shared, not cloned."""
+        t = torch.randn(2, 3)
+        result = rename_weight_keys({"old.k": t}, [("old.", "new.")])
+        assert result["new.k"].data_ptr() == t.data_ptr()
+
+    def test_collision_raises(self):
+        """Two source keys mapping to the same renamed key raises.
+
+        The error message must name both the colliding key and the original
+        producer key to aid debugging in large checkpoints.
+        """
+        state_dict = {
+            "a.weight": torch.tensor(1.0),
+            "b.weight": torch.tensor(2.0),
+        }
+        with pytest.raises(ValueError, match="collision") as exc_info:
+            rename_weight_keys(state_dict, [("a.", "x."), ("b.", "x.")])
+        message = str(exc_info.value)
+        # The producer ("a.weight", processed first) and the colliding key
+        # ("b.weight") must both appear.
+        assert "a.weight" in message
+        assert "b.weight" in message
+
+    def test_empty_state_dict(self):
+        """Empty input returns empty output."""
+        assert rename_weight_keys({}, [("a", "b")]) == {}
+
+
+class TestSplitFusedQkvValidation:
+    """Tests for QKV dimension mismatch detection."""
+
+    def test_wrong_dim_raises(self):
+        weight = torch.randn(100, 64)  # wrong size
+        with pytest.raises(ValueError, match="QKV weight dim 0 is 100"):
+            split_fused_qkv(weight, num_heads=8, num_kv_heads=2, head_dim=8)
+
+    def test_too_small_raises(self):
+        # Expected: 8*8 + 2*2*8 = 96, but provide 80
+        weight = torch.randn(80, 64)
+        with pytest.raises(ValueError, match="expected 96"):
+            split_fused_qkv(weight, num_heads=8, num_kv_heads=2, head_dim=8)
+
+
+class TestSplitGateUpProjValidation:
+    """Tests for gate_up dimension mismatch detection."""
+
+    def test_wrong_dim_raises(self):
+        weight = torch.randn(100, 64)  # wrong size
+        with pytest.raises(ValueError, match="gate_up weight dim 0 is 100"):
+            split_gate_up_proj(weight, intermediate_size=64)
+
+    def test_odd_size_raises(self):
+        # Expected: 2*32 = 64, but provide 63
+        weight = torch.randn(63, 16)
+        with pytest.raises(ValueError, match="expected 64"):
+            split_gate_up_proj(weight, intermediate_size=32)
+
+
+class TestTieWordEmbeddings:
+    """Tests for tie_word_embeddings."""
+
+    def test_copies_embed_to_head(self):
+        """If lm_head is missing, copies embed_tokens."""
+        t = torch.randn(4, 8)
+        sd = {"model.embed_tokens.weight": t}
+        tie_word_embeddings(sd)
+        assert "lm_head.weight" in sd
+        assert sd["lm_head.weight"].data_ptr() == t.data_ptr()
+
+    def test_copies_head_to_embed(self):
+        """If embed_tokens is missing, copies lm_head."""
+        t = torch.randn(4, 8)
+        sd = {"lm_head.weight": t}
+        tie_word_embeddings(sd)
+        assert "model.embed_tokens.weight" in sd
+        assert sd["model.embed_tokens.weight"].data_ptr() == t.data_ptr()
+
+    def test_both_present_no_change(self):
+        """If both present, no change."""
+        t1 = torch.randn(4, 8)
+        t2 = torch.randn(4, 8)
+        sd = {"model.embed_tokens.weight": t1, "lm_head.weight": t2}
+        tie_word_embeddings(sd)
+        assert sd["model.embed_tokens.weight"].data_ptr() == t1.data_ptr()
+        assert sd["lm_head.weight"].data_ptr() == t2.data_ptr()
+
+    def test_neither_present_raises(self):
+        """Raise ValueError if neither key is found (catches key mismatches)."""
+        import pytest
+
+        sd = {"other.weight": torch.randn(4)}
+        with pytest.raises(ValueError, match=r"neither.*found"):
+            tie_word_embeddings(sd)
+
+    def test_custom_keys(self):
+        """Custom embed/head keys."""
+        t = torch.randn(4, 8)
+        sd = {"enc.embed.weight": t}
+        tie_word_embeddings(sd, embed_key="enc.embed.weight", head_key="dec.head.weight")
+        assert "dec.head.weight" in sd
+
+
+class TestVlmDecoderWeights:
+    """Tests for vlm_decoder_weights."""
+
+    def test_strips_prefix_and_ties(self):
+        """Strips language_model. prefix and ties embeddings."""
+        embed = torch.randn(4, 8)
+        sd = {
+            "language_model.model.layers.0.weight": torch.randn(4),
+            "language_model.model.embed_tokens.weight": embed,
+            "language_model.model.norm.weight": torch.randn(4),
+            "vision_model.encoder.weight": torch.randn(4),
+        }
+        result = vlm_decoder_weights(sd, tie=True)
+        assert "model.layers.0.weight" in result
+        assert "model.embed_tokens.weight" in result
+        assert "lm_head.weight" in result
+        # Vision weights are excluded
+        assert not any("vision" in k for k in result)
+
+    def test_no_tie(self):
+        """Without tie, lm_head is not added."""
+        sd = {
+            "language_model.model.embed_tokens.weight": torch.randn(4, 8),
+        }
+        result = vlm_decoder_weights(sd, tie=False)
+        assert "lm_head.weight" not in result
+
+    def test_returns_new_dict(self):
+        """Returns a new dict, doesn't modify input."""
+        sd = {"language_model.w": torch.randn(4)}
+        result = vlm_decoder_weights(sd)
+        assert "w" in result
+        assert "language_model.w" in sd  # original unchanged
+
+    def test_custom_prefix(self):
+        """Works with a non-default prefix."""
+        sd = {"decoder.layers.0.weight": torch.randn(4)}
+        result = vlm_decoder_weights(sd, prefix="decoder.")
+        assert "layers.0.weight" in result
+
+
+class TestVlmEmbeddingWeights:
+    """Tests for vlm_embedding_weights."""
+
+    def test_filters_and_strips(self):
+        """Filters embed_tokens and strips prefixes."""
+        t = torch.randn(4, 8)
+        sd = {
+            "language_model.model.embed_tokens.weight": t,
+            "language_model.model.layers.0.weight": torch.randn(4),
+            "vision_model.encoder.weight": torch.randn(4),
+        }
+        result = vlm_embedding_weights(sd)
+        assert list(result.keys()) == ["embed_tokens.weight"]
+        assert result["embed_tokens.weight"].data_ptr() == t.data_ptr()
+
+    def test_strips_shorter_prefix(self):
+        """Falls through to shorter prefix."""
+        t = torch.randn(4, 8)
+        sd = {"language_model.embed_tokens.weight": t}
+        result = vlm_embedding_weights(sd)
+        assert list(result.keys()) == ["embed_tokens.weight"]
+
+    def test_no_prefix_match(self):
+        """Keys without matching prefix kept as-is."""
+        t = torch.randn(4, 8)
+        sd = {"embed_tokens.weight": t}
+        result = vlm_embedding_weights(sd)
+        assert list(result.keys()) == ["embed_tokens.weight"]
+
+    def test_empty_when_no_keyword(self):
+        """Returns empty dict if no keys match keyword."""
+        sd = {"language_model.layers.0.weight": torch.randn(4)}
+        result = vlm_embedding_weights(sd)
+        assert result == {}
+
+    def test_custom_keyword(self):
+        """Custom keyword filter."""
+        t = torch.randn(4, 8)
+        sd = {
+            "model.word_embedding.weight": t,
+            "model.layers.0.weight": torch.randn(4),
+        }
+        result = vlm_embedding_weights(sd, keyword="word_embedding", prefixes=("model.",))
+        assert list(result.keys()) == ["word_embedding.weight"]
+
+
+class TestVlmVisionWeights:
+    """Tests for vlm_vision_weights."""
+
+    def test_filters_and_renames(self):
+        """Keeps prefixed keys and renames fc1/fc2."""
+        fc1 = torch.randn(4, 8)
+        fc2 = torch.randn(8, 4)
+        sd = {
+            "vision_tower.encoder.layers.0.mlp.fc1.weight": fc1,
+            "vision_tower.encoder.layers.0.mlp.fc2.weight": fc2,
+            "multi_modal_projector.linear.weight": torch.randn(4),
+            "language_model.model.layers.0.weight": torch.randn(4),
+        }
+        result = vlm_vision_weights(sd, ("vision_tower.", "multi_modal_projector."))
+        assert set(result.keys()) == {
+            "vision_tower.encoder.layers.0.mlp.up_proj.weight",
+            "vision_tower.encoder.layers.0.mlp.down_proj.weight",
+            "multi_modal_projector.linear.weight",
+        }
+        assert result["vision_tower.encoder.layers.0.mlp.up_proj.weight"].data_ptr() == (
+            fc1.data_ptr()
+        )
+
+    def test_single_prefix(self):
+        """Works with a single-element prefix tuple."""
+        sd = {
+            "vision_model.layers.0.mlp.fc1.weight": torch.randn(2),
+            "other.weight": torch.randn(2),
+        }
+        result = vlm_vision_weights(sd, ("vision_model.",))
+        assert list(result.keys()) == ["vision_model.layers.0.mlp.up_proj.weight"]
+
+    def test_empty_when_no_match(self):
+        """Returns empty dict when no key matches the prefixes."""
+        sd = {"language_model.layers.0.weight": torch.randn(2)}
+        assert vlm_vision_weights(sd, ("vision_tower.",)) == {}
+
+
+class TestPreprocessGptqWeights:
+    """Tests for GPTQ weight preprocessing.
+
+    Uses realistic GPTQ shapes for INT4, group_size=32:
+    K=256, N=128 → K_packed=32, n_groups=8, blob_size=16.
+    """
+
+    K = 256
+    N = 128
+    BITS = 4
+    GROUP_SIZE = 32
+    K_PACKED = K * BITS // 32  # 32
+    N_GROUPS = K // GROUP_SIZE  # 8
+    BLOB_SIZE = GROUP_SIZE * BITS // 8  # 16
+    # qzeros packs (32 // BITS)=8 zero points per int32
+    N_GROUPS_PACKED = N_GROUPS * BITS // 32  # 1
+
+    def test_qweight_renamed_to_weight(self):
+        sd = {
+            "q_proj.qweight": torch.randint(0, 255, (self.K_PACKED, self.N), dtype=torch.int32)
+        }
+        result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        assert "q_proj.weight" in result
+        assert "q_proj.qweight" not in result
+
+    def test_qweight_shape_3d(self):
+        """Weight must be [N, n_blocks, blob_size] for MatMulNBits."""
+        sd = {
+            "q_proj.qweight": torch.randint(0, 255, (self.K_PACKED, self.N), dtype=torch.int32)
+        }
+        result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        w = result["q_proj.weight"]
+        assert w.shape == (self.N, self.N_GROUPS, self.BLOB_SIZE)
+        assert w.dtype == torch.uint8
+
+    def test_qzeros_renamed_to_zero_points(self):
+        sd = {
+            "q_proj.qweight": torch.randint(
+                0, 255, (self.K_PACKED, self.N), dtype=torch.int32
+            ),
+            "q_proj.qzeros": torch.randint(
+                0, 255, (max(1, self.N_GROUPS_PACKED), self.N), dtype=torch.int32
+            ),
+        }
+        result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        assert "q_proj.zero_points" in result
+        assert "q_proj.qzeros" not in result
+
+    def test_g_idx_dropped(self):
+        sd = {
+            "q_proj.g_idx": torch.arange(self.K),
+            "q_proj.scales": torch.randn(self.N_GROUPS, self.N),
+        }
+        result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        assert not any(k.endswith(".g_idx") for k in result)
+        assert "q_proj.scales" in result
+
+    def test_g_idx_nontrivial_warns(self, caplog):
+        """Non-trivial g_idx (desc_act) should emit a warning."""
+        import logging
+
+        sd = {
+            "q_proj.g_idx": torch.tensor([7, 3, 0, 1]),  # not sequential
+        }
+        with caplog.at_level(logging.WARNING):
+            result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        assert not any(k.endswith(".g_idx") for k in result)
+        assert "desc_act" in caplog.text
+
+    def test_scales_transposed(self):
+        sd = {"q_proj.scales": torch.randn(self.N_GROUPS, self.N)}
+        result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        assert result["q_proj.scales"].shape == (self.N, self.N_GROUPS)
+
+    def test_expert_major_tensors_preserve_expert_axis(self):
+        num_experts = 64
+        sd = {
+            "experts.qweight": torch.randint(
+                0,
+                255,
+                (num_experts, self.K_PACKED, self.N),
+                dtype=torch.int32,
+            ),
+            "experts.qzeros": torch.randint(
+                0,
+                255,
+                (num_experts, max(1, self.N_GROUPS_PACKED), self.N),
+                dtype=torch.int32,
+            ),
+            "experts.scales": torch.randn(num_experts, self.N_GROUPS, self.N),
+        }
+        result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+        assert result["experts.weight"].shape == (
+            num_experts,
+            self.N,
+            self.N_GROUPS,
+            self.BLOB_SIZE,
+        )
+        assert result["experts.zero_points"].shape == (
+            num_experts,
+            self.N,
+            self.N_GROUPS * self.BITS // 8,
+        )
+        assert result["experts.scales"].shape == (
+            num_experts,
+            self.N,
+            self.N_GROUPS,
+        )
+
+    def test_non_gptq_keys_pass_through(self):
+        t = torch.randn(4, 8)
+        sd = {"model.embed_tokens.weight": t, "lm_head.weight": t.clone()}
+        result = preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        assert "model.embed_tokens.weight" in result
+        assert "lm_head.weight" in result
+        assert torch.equal(result["model.embed_tokens.weight"], t)
+
+    def test_missing_qweight_raises(self):
+        """Qzeros without matching qweight raises ValueError."""
+        sd = {"q_proj.qzeros": torch.zeros(1, self.N, dtype=torch.int32)}
+        with pytest.raises(ValueError, match=r"Missing q_proj\.qweight"):
+            preprocess_gptq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+    def test_per_channel_zero_group_indices_are_trivial(self, caplog):
+        result = preprocess_gptq_weights(
+            {"proj.g_idx": torch.zeros(96, dtype=torch.int32)}, group_size=-1
+        )
+        assert result == {}
+        assert "desc_act" not in caplog.text
+
+
+@pytest.mark.parametrize("preprocess", [preprocess_gptq_weights, preprocess_awq_weights])
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("prefix", [(), (2,)])
+@pytest.mark.parametrize(
+    ("k", "group_size"),
+    [(7, -1), (9, -1), (33, -1), (96, -1), (1536, -1), (6144, -1), (33, 33)],
+)
+def test_per_channel_dotted_weights_preserve_codes_and_scales(
+    preprocess, bits, prefix, k, group_size
+):
+    n = 8
+    packed = (
+        torch.arange(math.prod(prefix) * math.ceil(k * bits / 32) * n)
+        .reshape(*prefix, -1, n)
+        .to(torch.int32)
+    )
+    scales = torch.arange(1, math.prod(prefix) * n + 1).reshape(*prefix, 1, n).float()
+    raw = {
+        "proj.qweight": packed,
+        "proj.scales": scales,
+        "proj.qzeros": torch.full((*prefix, 1, n), 0x55555555, dtype=torch.int32),
+    }
+    result = preprocess(raw, bits=bits, group_size=group_size, in_features=k)
+    weight = result["proj.weight"]
+    blob_size = math.ceil(k * bits / 8)
+    assert weight.shape == (*prefix, n, 1, blob_size)
+    expected = (
+        packed.transpose(-1, -2)
+        .contiguous()
+        .reshape(-1)
+        .view(torch.uint8)
+        .reshape(*prefix, n, -1)
+    )
+    torch.testing.assert_close(weight[..., 0, :], expected[..., :blob_size])
+    torch.testing.assert_close(result["proj.scales"], scales.transpose(-1, -2))
+    assert result["proj.zero_points"].shape == (*prefix, n, 1)
+    expected_zero = (
+        0x44
+        if preprocess is preprocess_awq_weights and bits == 4
+        else (0x54 if preprocess is preprocess_awq_weights else 0x55)
+    )
+    assert (result["proj.zero_points"] == expected_zero).all()
+
+
+@pytest.mark.parametrize("bits", [2, 4, 8])
+@pytest.mark.parametrize("prefix", [(), (2,)])
+@pytest.mark.parametrize(
+    ("k", "group_size"),
+    [(7, -1), (9, -1), (33, -1), (96, -1), (1536, -1), (6144, -1), (33, 33)],
+)
+def test_per_channel_olive_weights_preserve_codes_and_scales(bits, prefix, k, group_size):
+    n = 8
+    blob_size = math.ceil(k * bits / 8)
+    packed = (
+        torch.arange(math.prod(prefix) * n * blob_size)
+        .reshape(*prefix, n, blob_size)
+        .to(torch.uint8)
+    )
+    scales = torch.arange(1, math.prod(prefix) * n + 1).reshape(*prefix, n, 1).float()
+    zeros = torch.full((*prefix, n, 1), 3, dtype=torch.uint8)
+    result = preprocess_olive_weights(
+        {
+            "proj.weight_qweight": packed,
+            "proj.weight_scales": scales,
+            "proj.weight_qzeros": zeros,
+        },
+        bits=bits,
+        group_size=group_size,
+        in_features=k,
+    )
+    weight = result["proj.weight"]
+    assert weight.shape == (*prefix, n, 1, blob_size)
+    torch.testing.assert_close(weight[..., 0, :], packed)
+    assert result["proj.scales"] is scales
+    assert result["proj.zero_points"] is zeros
+
+
+@pytest.mark.parametrize("packed_bytes", [16, 18])
+@pytest.mark.parametrize("group_size", [-1, 33])
+def test_per_channel_olive_rejects_mismatched_logical_width(packed_bytes, group_size):
+    with pytest.raises(ValueError, match="Per-channel packed width"):
+        preprocess_olive_weights(
+            {"proj.weight_qweight": torch.zeros(8, packed_bytes, dtype=torch.uint8)},
+            bits=4,
+            group_size=group_size,
+            in_features=33,
+        )
+
+
+@pytest.mark.parametrize("preprocess", [preprocess_gptq_weights, preprocess_awq_weights])
+@pytest.mark.parametrize("packed_words", [4, 6])
+@pytest.mark.parametrize("group_size", [-1, 33])
+def test_per_channel_dotted_rejects_mismatched_logical_width(
+    preprocess, packed_words, group_size
+):
+    with pytest.raises(ValueError, match="Per-channel packed width"):
+        preprocess(
+            {"proj.qweight": torch.zeros(packed_words, 8, dtype=torch.int32)},
+            bits=4,
+            group_size=group_size,
+            in_features=33,
+        )
+
+
+@pytest.mark.parametrize(
+    ("preprocess", "scales_key", "shape"),
+    [
+        (preprocess_olive_weights, "proj.weight_scales", (8, 2)),
+        (preprocess_gptq_weights, "proj.scales", (2, 8)),
+        (preprocess_awq_weights, "proj.scales", (2, 8)),
+    ],
+)
+@pytest.mark.parametrize("group_size", [-1, 33])
+def test_per_channel_rejects_multiple_scale_groups(preprocess, scales_key, shape, group_size):
+    with pytest.raises(ValueError, match="must have one group"):
+        preprocess({scales_key: torch.ones(shape)}, group_size=group_size, in_features=33)
+
+
+class TestPreprocessOliveWeights:
+    """Tests for Olive uint8-packed weight preprocessing."""
+
+    K = 256
+    N = 128
+    BITS = 4
+    GROUP_SIZE = 32
+    PACKED_K = K * BITS // 8
+    N_BLOCKS = K // GROUP_SIZE
+    BLOB_SIZE = GROUP_SIZE * BITS // 8
+
+    def test_qweight_renamed_and_reshaped_to_matmulnbits_weight(self):
+        sd = {
+            "q_proj.weight_qweight": torch.randint(
+                0, 255, (self.N, self.PACKED_K), dtype=torch.uint8
+            )
+        }
+
+        result = preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+        assert "q_proj.weight" in result
+        assert "q_proj.weight_qweight" not in result
+        assert result["q_proj.weight"].shape == (self.N, self.N_BLOCKS, self.BLOB_SIZE)
+        assert result["q_proj.weight"].dtype == torch.uint8
+
+    def test_fused_moe_qweight_renamed_and_reshaped(self):
+        """Fused MoE expert params (no nested ``.weight``) get ``.weight`` appended."""
+        num_experts = 4
+        sd = {
+            "mlp.experts.gate_up_proj_qweight": torch.randint(
+                0, 255, (num_experts, self.N, self.PACKED_K), dtype=torch.uint8
+            )
+        }
+
+        result = preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+        assert "mlp.experts.gate_up_proj.weight" in result
+        assert "mlp.experts.gate_up_proj_qweight" not in result
+        assert result["mlp.experts.gate_up_proj.weight"].shape == (
+            num_experts,
+            self.N,
+            self.N_BLOCKS,
+            self.BLOB_SIZE,
+        )
+
+    def test_scales_orientation_is_preserved(self):
+        scales = torch.randn(self.N, self.N_BLOCKS)
+
+        result = preprocess_olive_weights(
+            {"q_proj.weight_scales": scales}, bits=self.BITS, group_size=self.GROUP_SIZE
+        )
+
+        assert result["q_proj.scales"] is scales
+
+    def test_qzeros_renamed_to_zero_points_without_reshape(self):
+        qzeros = torch.randint(0, 255, (self.N, self.N_BLOCKS // 2), dtype=torch.uint8)
+
+        result = preprocess_olive_weights(
+            {"q_proj.weight_qzeros": qzeros}, bits=self.BITS, group_size=self.GROUP_SIZE
+        )
+
+        assert "q_proj.zero_points" in result
+        assert "q_proj.weight_qzeros" not in result
+        assert torch.equal(result["q_proj.zero_points"], qzeros)
+
+    def test_non_quantized_keys_pass_through(self):
+        weight = torch.randn(4, 8)
+
+        result = preprocess_olive_weights(
+            {"model.embed_tokens.weight": weight}, bits=self.BITS, group_size=self.GROUP_SIZE
+        )
+
+        assert result["model.embed_tokens.weight"] is weight
+
+    def test_non_uint8_qweight_raises(self):
+        sd = {
+            "q_proj.weight_qweight": torch.randint(
+                0, 255, (self.N, self.PACKED_K), dtype=torch.int32
+            )
+        }
+
+        with pytest.raises(ValueError, match="Olive qweight must be uint8"):
+            preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+    def test_non_uint8_qzeros_raises(self):
+        sd = {
+            "q_proj.weight_qzeros": torch.randint(
+                0, 255, (self.N, self.N_BLOCKS // 2), dtype=torch.int32
+            )
+        }
+        with pytest.raises(ValueError, match="Olive qzeros must be uint8"):
+            preprocess_olive_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+    # --- Quantized embedding (GatherBlockQuantized) ---
+
+    V = 64  # vocab size for embedding tests
+
+    def test_embed_qweight_kept_2d(self):
+        """embed_tokens.weight_qweight targets GatherBlockQuantized: keep 2-D uint8."""
+        qweight = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
+        result = preprocess_olive_weights(
+            {"model.embed_tokens.weight_qweight": qweight},
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            quantize_embeddings=True,
+        )
+        out = result["model.embed_tokens.qweight"]
+        assert out.shape == (self.V, self.PACKED_K)
+        assert out.dtype == torch.uint8
+
+    def test_embed_qzeros_renamed_to_zero_points(self):
+        qzeros = torch.randint(0, 255, (self.V, self.N_BLOCKS // 2), dtype=torch.uint8)
+        result = preprocess_olive_weights(
+            {"model.embed_tokens.weight_qzeros": qzeros},
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            quantize_embeddings=True,
+        )
+        assert "model.embed_tokens.zero_points" in result
+        assert "model.embed_tokens.weight_qzeros" not in result
+
+    def test_embed_non_uint8_qweight_raises(self):
+        sd = {
+            "model.embed_tokens.weight_qweight": torch.randint(
+                0, 255, (self.V, self.PACKED_K), dtype=torch.int32
+            )
+        }
+        with pytest.raises(ValueError, match="Olive embedding qweight must be uint8"):
+            preprocess_olive_weights(
+                sd, bits=self.BITS, group_size=self.GROUP_SIZE, quantize_embeddings=True
+            )
+
+    def test_embed_non_uint8_qzeros_raises(self):
+        sd = {
+            "model.embed_tokens.weight_qzeros": torch.randint(
+                0, 255, (self.V, self.N_BLOCKS // 2), dtype=torch.int32
+            )
+        }
+        with pytest.raises(ValueError, match="Olive embedding qzeros must be uint8"):
+            preprocess_olive_weights(
+                sd, bits=self.BITS, group_size=self.GROUP_SIZE, quantize_embeddings=True
+            )
+
+    def test_embed_qweight_with_quantize_embeddings_false_raises(self):
+        """quantize_embeddings=False must not silently accept a packed embedding key.
+
+        Regression test: previously this branch matched on key suffix alone
+        and ignored ``quantize_embeddings`` entirely, so a caller/config
+        mismatch (a packed embedding key present while the caller declares
+        the embedding float) would either sneak through unnoticed or, worse,
+        get incorrectly reshaped/renamed via the generic Linear branch.
+        """
+        sd = {
+            "model.embed_tokens.weight_qweight": torch.randint(
+                0, 255, (self.V, self.PACKED_K), dtype=torch.uint8
+            )
+        }
+        with pytest.raises(ValueError, match="quantize_embeddings=False"):
+            preprocess_olive_weights(
+                sd, bits=self.BITS, group_size=self.GROUP_SIZE, quantize_embeddings=False
+            )
+
+    # --- Tied LM head synthesis ---
+
+    def test_tied_quantized_head_produces_no_lm_head_keys(self):
+        """A tied *quantized* head shares the embed Parameters in the module.
+
+        So preprocessing must NOT emit duplicate lm_head.* initializers.
+        """
+        qweight = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
+        scales = torch.randn(self.V, self.N_BLOCKS)
+        qzeros = torch.randint(0, 255, (self.V, self.N_BLOCKS // 2), dtype=torch.uint8)
+        result = preprocess_olive_weights(
+            {
+                "model.embed_tokens.weight_qweight": qweight,
+                "model.embed_tokens.weight_scales": scales,
+                "model.embed_tokens.weight_qzeros": qzeros,
+            },
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            quantize_embeddings=True,
+            quantize_lm_head=True,
+            tie_word_embeddings=True,
+        )
+        assert not any(k.startswith("lm_head.") for k in result)
+        assert "model.embed_tokens.qweight" in result
+        assert "model.embed_tokens.zero_points" in result
+
+    def test_float_tie_fallback(self):
+        """Unquantized embed + tie -> lm_head shares the float embedding table."""
+        embed = torch.randn(self.V, self.K)
+        result = preprocess_olive_weights(
+            {"model.embed_tokens.weight": embed},
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            tie_word_embeddings=True,
+        )
+        assert result["lm_head.weight"] is embed
+
+    def test_float_tie_fallback_uses_custom_keys(self):
+        embed = torch.randn(self.V, self.K)
+        result = preprocess_olive_weights(
+            {"decoder.model.embed_tokens.weight": embed},
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            tie_word_embeddings=True,
+            embed_key="decoder.model.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+        )
+        assert result["decoder.lm_head.weight"] is embed
+        assert "lm_head.weight" not in result
+
+    def test_untied_quantized_lm_head_not_overwritten(self):
+        """A present lm_head.weight_qweight must not be replaced by embed synthesis."""
+        lm_head = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
+        embed = torch.randint(0, 255, (self.V, self.PACKED_K), dtype=torch.uint8)
+        result = preprocess_olive_weights(
+            {
+                "lm_head.weight_qweight": lm_head,
+                "model.embed_tokens.weight_qweight": embed,
+            },
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+            quantize_embeddings=True,
+            quantize_lm_head=True,
+            tie_word_embeddings=False,
+        )
+        assert torch.equal(
+            result["lm_head.weight"],
+            lm_head.reshape(self.V, -1, self.BLOB_SIZE),
+        )
+
+
+class TestPreprocessAwqWeights:
+    """Tests for AWQ weight preprocessing.
+
+    Uses same realistic shapes as GPTQ tests: INT4, group_size=32,
+    K=256, N=128.
+    """
+
+    K = 256
+    N = 128
+    BITS = 4
+    GROUP_SIZE = 32
+    K_PACKED = K * BITS // 32  # 32
+    N_GROUPS = K // GROUP_SIZE  # 8
+    BLOB_SIZE = GROUP_SIZE * BITS // 8  # 16
+    N_GROUPS_PACKED = N_GROUPS * BITS // 32  # 1
+
+    def test_qweight_renamed_to_weight(self):
+        sd = {
+            "q_proj.qweight": torch.randint(0, 255, (self.K_PACKED, self.N), dtype=torch.int32)
+        }
+        result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        assert "q_proj.weight" in result
+        assert "q_proj.qweight" not in result
+
+    def test_qweight_shape_3d(self):
+        """Weight must be [N, n_blocks, blob_size] for MatMulNBits."""
+        sd = {
+            "q_proj.qweight": torch.randint(0, 255, (self.K_PACKED, self.N), dtype=torch.int32)
+        }
+        result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        w = result["q_proj.weight"]
+        assert w.shape == (self.N, self.N_GROUPS, self.BLOB_SIZE)
+        assert w.dtype == torch.uint8
+
+    def test_qzeros_renamed_to_zero_points(self):
+        sd = {
+            "q_proj.qweight": torch.randint(
+                0, 255, (self.K_PACKED, self.N), dtype=torch.int32
+            ),
+            "q_proj.qzeros": torch.randint(
+                0,
+                255,
+                (max(1, self.N_GROUPS_PACKED), self.N),
+                dtype=torch.int32,
+            ),
+        }
+        result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        assert "q_proj.zero_points" in result
+        assert "q_proj.qzeros" not in result
+
+    def test_zero_point_offset_subtracted(self):
+        """AWQ zero points have +1 offset that must be subtracted."""
+        # Create qzeros where every byte is 0x05 (all nibbles = 5).
+        # After unpacking to uint8 we get 5 per element, after -1 → 4.
+        sd = {
+            "q_proj.qweight": torch.randint(
+                0, 255, (self.K_PACKED, self.N), dtype=torch.int32
+            ),
+            "q_proj.qzeros": torch.full(
+                (max(1, self.N_GROUPS_PACKED), self.N),
+                0x05050505,
+                dtype=torch.int32,
+            ),
+        }
+        result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        zp = result["q_proj.zero_points"]
+        # Each byte was 0x05=5, after -1 → 4
+        assert (zp == 4).all()
+
+    def test_no_g_idx_handling(self):
+        """AWQ does not have g_idx — unknown keys should pass through."""
+        sd = {
+            "q_proj.scales": torch.randn(self.N_GROUPS, self.N),
+            "q_proj.some_extra": torch.randn(4),
+        }
+        result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        assert "q_proj.some_extra" in result
+
+    def test_scales_transposed(self):
+        sd = {"q_proj.scales": torch.randn(self.N_GROUPS, self.N)}
+        result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        assert result["q_proj.scales"].shape == (self.N, self.N_GROUPS)
+
+    def test_same_qweight_reshape_as_gptq(self):
+        """AWQ and GPTQ should produce identical qweight reshapes."""
+        qweight = torch.randint(0, 255, (self.K_PACKED, self.N), dtype=torch.int32)
+        gptq_result = preprocess_gptq_weights(
+            {"p.qweight": qweight.clone(), "p.scales": torch.randn(self.N_GROUPS, self.N)},
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+        )
+        awq_result = preprocess_awq_weights(
+            {"p.qweight": qweight.clone(), "p.scales": torch.randn(self.N_GROUPS, self.N)},
+            bits=self.BITS,
+            group_size=self.GROUP_SIZE,
+        )
+        assert torch.equal(gptq_result["p.weight"], awq_result["p.weight"])
+
+    def test_zero_valued_qzeros_no_underflow(self):
+        """When raw qzeros bytes are 0, subtraction must not underflow uint8."""
+        sd = {
+            "q_proj.qweight": torch.randint(
+                0, 255, (self.K_PACKED, self.N), dtype=torch.int32
+            ),
+            "q_proj.qzeros": torch.zeros(
+                max(1, self.N_GROUPS_PACKED), self.N, dtype=torch.int32
+            ),
+        }
+        result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        zp = result["q_proj.zero_points"]
+        # 0 - 1 clamped to 0; no uint8 wrap-around to 255
+        assert zp.dtype == torch.uint8
+        assert (zp == 0).all()
+
+    def test_zero_point_offset_per_nibble(self):
+        """AWQ -1 offset must apply per-nibble, not per-byte.
+
+        0x88 = low nibble 8, high nibble 8.  After per-nibble -1:
+        low = 7, high = 7 → repacked = 0x77.
+        A byte-level subtract would give 0x87 (wrong).
+        """
+        sd = {
+            "q_proj.qweight": torch.randint(
+                0, 255, (self.K_PACKED, self.N), dtype=torch.int32
+            ),
+            "q_proj.qzeros": torch.full(
+                (max(1, self.N_GROUPS_PACKED), self.N),
+                -2004318072,  # 0x88888888 as signed int32
+                dtype=torch.int32,
+            ),
+        }
+        result = preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+        zp = result["q_proj.zero_points"]
+        # Both nibbles decremented: 0x88 → 0x77
+        assert (zp == 0x77).all()
+
+    def test_missing_qweight_raises(self):
+        """Qzeros without matching qweight raises ValueError."""
+        sd = {"q_proj.qzeros": torch.zeros(1, self.N, dtype=torch.int32)}
+        with pytest.raises(ValueError, match=r"Missing q_proj\.qweight"):
+            preprocess_awq_weights(sd, bits=self.BITS, group_size=self.GROUP_SIZE)
+
+
+class TestPreprocessQuantizedWeights:
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq", "olive"])
+    def test_defers_ordinary_sidecars_without_changing_float_tying(self, quant_method):
+        quantization = QuantizationConfig(
+            bits=4, group_size=16, quant_method=quant_method, sym=False
+        )
+        if quant_method == "olive":
+            weight_key, scales_key = "layer.weight_qweight", "layer.weight_scales"
+            zeros_key = "layer.weight_qzeros"
+            packed = torch.arange(256).reshape(16, 16).to(torch.uint8)
+            scales = torch.arange(32, dtype=torch.float32).reshape(16, 2)
+            zeros = torch.ones(16, 1, dtype=torch.uint8)
+        else:
+            weight_key, scales_key = "layer.qweight", "layer.scales"
+            zeros_key = "layer.qzeros"
+            shape = (4, 16) if quant_method == "gptq" else (32, 2)
+            packed = torch.arange(64, dtype=torch.int32).reshape(shape)
+            scales = torch.arange(32, dtype=torch.float32).reshape(2, 16)
+            zeros = torch.arange(4, dtype=torch.int32).reshape(2, 2)
+        embedding = torch.ones(8, 32)
+        state_dict = {
+            weight_key: packed,
+            scales_key: scales,
+            zeros_key: zeros,
+            "model.embed_tokens.weight": embedding,
+        }
+
+        result = preprocess_quantized_weights(
+            state_dict, quantization, tie_embeddings=True, defer_non_expert_sidecars=True
+        )
+
+        assert result[weight_key] is packed
+        assert result[scales_key] is scales
+        assert result[zeros_key] is zeros
+        assert result["lm_head.weight"] is embedding
+        assert "layer.weight" not in result
+        assert "lm_head.weight" not in state_dict
+
+    @pytest.mark.parametrize("quant_method", ["gptq", "awq", "olive"])
+    def test_dispatches_quantization_method(self, quant_method):
+        quantization = QuantizationConfig(bits=4, group_size=16, quant_method=quant_method)
+        if quant_method == "olive":
+            state_dict = {"layer.weight_qweight": torch.zeros(8, 16, dtype=torch.uint8)}
+        else:
+            state_dict = {"layer.qweight": torch.zeros(4, 8, dtype=torch.int32)}
+
+        result = preprocess_quantized_weights(state_dict, quantization)
+
+        assert result["layer.weight"].shape == (8, 2, 8)
+
+    @pytest.mark.parametrize(
+        "suffix",
+        ["_qweight", "_scales", "_qzeros", ".qweight", ".scales", ".qzeros"],
+    )
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_rejects_packed_experts_for_unsupported_qmoe_abi(self, suffix, defer):
+        quantization = QuantizationConfig(bits=8, group_size=16, quant_method="olive")
+        state_dict = {
+            f"decoder.model.layers.0.mlp.experts.gate_up_proj{suffix}": torch.zeros(1)
+        }
+
+        with pytest.raises(ValueError, match="QMoE ABI"):
+            preprocess_quantized_weights(
+                state_dict,
+                quantization,
+                qmoe_target_path=".mlp",
+                defer_non_expert_sidecars=defer,
+            )
+
+    def test_rejects_unsupported_qmoe_quantization_method(self):
+        quantization = QuantizationConfig(bits=4, group_size=16, quant_method="gptq")
+        with pytest.raises(NotImplementedError, match="only supports QMoE export"):
+            preprocess_quantized_weights(
+                {},
+                quantization,
+                qmoe_target_path=".mlp",
+                qmoe_quant_methods=("olive",),
+            )
+
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_per_expert_gptq_moe_produces_populated_fused_qmoe(self, defer):
+        """Per-expert GPTQ experts stack+pack into non-empty fused QMoE params.
+
+        This is the end-to-end guard for the per-expert -> fused-QMoE path:
+        a symmetric GPTQ MoE checkpoint whose routed experts are stored as
+        separate modules must yield populated ``fc1/fc2_experts_weights`` with a
+        leading expert axis, and leave no per-expert expert tensors behind.
+        """
+        quantization = QuantizationConfig(bits=4, group_size=32, quant_method="gptq", sym=True)
+        num_experts = 3
+        hidden, inter = 256, 128
+        prefix = "model.layers.0.mlp.experts"
+        state_dict: dict[str, torch.Tensor] = {}
+        for e in range(num_experts):
+            # gate/up: in=hidden(256), out=inter(128); down: in=inter(128), out=hidden(256)
+            for proj, k, n in (
+                ("gate_proj", hidden, inter),
+                ("up_proj", hidden, inter),
+                ("down_proj", inter, hidden),
+            ):
+                k_packed = k * 4 // 32
+                n_groups = k // 32
+                state_dict[f"{prefix}.{e}.{proj}.qweight"] = torch.randint(
+                    0, 255, (k_packed, n), dtype=torch.int32
+                )
+                state_dict[f"{prefix}.{e}.{proj}.scales"] = torch.randn(n_groups, n)
+
+        result = preprocess_quantized_weights(
+            state_dict,
+            quantization,
+            qmoe_target_path=".mlp",
+            defer_non_expert_sidecars=defer,
+        )
+
+        fc1 = result["model.layers.0.mlp.fc1_experts_weights"]
+        fc2 = result["model.layers.0.mlp.fc2_experts_weights"]
+        assert fc1.shape[0] == num_experts
+        assert fc2.shape[0] == num_experts
+        assert fc1.shape[1] == 2 * inter  # gate rows then up rows
+        assert fc2.shape[1] == hidden
+        assert fc1.numel() > 0 and fc2.numel() > 0
+        # No per-expert expert tensors survive the fusion.
+        assert not any(".experts." in k and ".gate_proj" in k for k in result)
+        assert not any(".experts." in k and ".down_proj" in k for k in result)
+
+    @pytest.mark.parametrize("flag", ["quantize_embeddings", "quantize_lm_head"])
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_rejects_quantized_embedding_or_lm_head(self, flag, defer):
+        quantization = QuantizationConfig(
+            bits=4,
+            group_size=16,
+            quant_method="olive",
+            **{flag: True},
+        )
+        with pytest.raises(NotImplementedError, match="Quantized embeddings and LM heads"):
+            preprocess_quantized_weights(
+                {},
+                quantization,
+                reject_quantized_embeddings_lm_head=True,
+                defer_non_expert_sidecars=defer,
+            )
+
+    @pytest.mark.parametrize(
+        ("float_key", "suffix"),
+        [
+            (float_key, suffix)
+            for float_key in (
+                "decoder.model.embed_tokens.weight",
+                "decoder.lm_head.weight",
+            )
+            for suffix in (
+                "_qweight",
+                "_scales",
+                "_qzeros",
+                ".qweight",
+                ".scales",
+                ".qzeros",
+            )
+        ],
+    )
+    def test_rejects_packed_embedding_or_head_key_without_config_flags(
+        self, float_key, suffix
+    ):
+        owner = float_key.removesuffix(".weight")
+        packed_key = float_key + suffix if suffix.startswith("_") else owner + suffix
+        quantization = QuantizationConfig(bits=4, group_size=16, quant_method="gptq")
+
+        with pytest.raises(NotImplementedError, match="Packed checkpoint key") as error:
+            preprocess_quantized_weights(
+                {packed_key: torch.zeros(1)},
+                quantization,
+                reject_quantized_embeddings_lm_head=True,
+                embed_key="decoder.model.embed_tokens.weight",
+                head_key="decoder.lm_head.weight",
+            )
+
+        assert packed_key in str(error.value)
+
+    def test_ties_custom_float_keys(self):
+        embedding = torch.randn(8, 16)
+        result = preprocess_quantized_weights(
+            {"decoder.model.embed_tokens.weight": embedding},
+            None,
+            tie_embeddings=True,
+            embed_key="decoder.model.embed_tokens.weight",
+            head_key="decoder.lm_head.weight",
+        )
+
+        assert result["decoder.lm_head.weight"] is embedding
+
+
+class TestMergeLoraWeights:
+    """Tests for merge_lora_weights()."""
+
+    def test_basic_merge(self):
+        """LoRA delta is added to base weight: W' = W + (alpha/rank) * B @ A."""
+        base = {"layer.weight": torch.zeros(4, 8)}
+        lora = {
+            "layer.lora_A.weight": torch.ones(2, 8),  # rank=2
+            "layer.lora_B.weight": torch.ones(4, 2),
+        }
+        result = merge_lora_weights(base, lora, default_alpha=2.0)
+        # scale = alpha/rank = 2/2 = 1.0
+        # delta = B @ A = ones(4,2) @ ones(2,8) = 2*ones(4,8)
+        expected = torch.full((4, 8), 2.0)
+        torch.testing.assert_close(result["layer.weight"], expected)
+
+    def test_alpha_from_tensor(self):
+        """Per-layer alpha tensor overrides default_alpha."""
+        base = {"layer.weight": torch.zeros(4, 8)}
+        lora = {
+            "layer.lora_A.weight": torch.eye(2, 8),
+            "layer.lora_B.weight": torch.eye(4, 2),
+            "layer.lora_A.alpha": torch.tensor(4.0),
+        }
+        result = merge_lora_weights(base, lora, default_alpha=1.0)
+        # scale = alpha/rank = 4/2 = 2.0
+        # delta = B @ A = eye(4,2) @ eye(2,8) -> (4,8) with 1s in top-left 2x2
+        # scaled delta: 2.0 * delta
+        w = result["layer.weight"]
+        assert w[0, 0].item() == pytest.approx(2.0)
+        assert w[2, 0].item() == pytest.approx(0.0)
+
+    def test_default_alpha_equals_rank(self):
+        """When no alpha provided, scale = rank/rank = 1.0."""
+        base = {"layer.weight": torch.zeros(4, 8)}
+        lora = {
+            "layer.lora_A.weight": torch.ones(2, 8),
+            "layer.lora_B.weight": torch.ones(4, 2),
+        }
+        result = merge_lora_weights(base, lora)
+        # scale = rank/rank = 1.0, delta = 2*ones(4,8)
+        expected = torch.full((4, 8), 2.0)
+        torch.testing.assert_close(result["layer.weight"], expected)
+
+    def test_preserves_base_dtype(self):
+        """Merged result keeps the base weight's dtype (e.g. float16)."""
+        base = {"layer.weight": torch.zeros(4, 8, dtype=torch.float16)}
+        lora = {
+            "layer.lora_A.weight": torch.ones(2, 8),
+            "layer.lora_B.weight": torch.ones(4, 2),
+        }
+        result = merge_lora_weights(base, lora, default_alpha=2.0)
+        assert result["layer.weight"].dtype == torch.float16
+
+    def test_multiple_layers(self):
+        """Merges LoRA for multiple layers independently."""
+        base = {
+            "attn.q_proj.weight": torch.zeros(4, 4),
+            "attn.v_proj.weight": torch.ones(4, 4),
+        }
+        lora = {
+            "attn.q_proj.lora_A.weight": torch.eye(1, 4),
+            "attn.q_proj.lora_B.weight": torch.eye(4, 1),
+            "attn.v_proj.lora_A.weight": torch.eye(1, 4),
+            "attn.v_proj.lora_B.weight": torch.eye(4, 1),
+        }
+        result = merge_lora_weights(base, lora, default_alpha=1.0)
+        # Both get identity delta (rank=1, alpha=1, scale=1)
+        assert result["attn.q_proj.weight"][0, 0].item() == pytest.approx(1.0)
+        assert result["attn.v_proj.weight"][0, 0].item() == pytest.approx(2.0)
+
+    def test_missing_base_key_warns(self, caplog):
+        """Warns when LoRA targets a weight not in base model."""
+        import logging
+
+        base = {"other.weight": torch.zeros(4, 4)}
+        lora = {
+            "missing.lora_A.weight": torch.ones(2, 4),
+            "missing.lora_B.weight": torch.ones(4, 2),
+        }
+        with caplog.at_level(logging.WARNING):
+            result = merge_lora_weights(base, lora)
+        assert "not found in base model" in caplog.text
+        # base unchanged
+        torch.testing.assert_close(result["other.weight"], torch.zeros(4, 4))
+
+    def test_orphan_lora_a_warns(self, caplog):
+        """Warns when lora_A has no matching lora_B."""
+        import logging
+
+        base = {"layer.weight": torch.zeros(4, 4)}
+        lora = {"layer.lora_A.weight": torch.ones(2, 4)}
+        with caplog.at_level(logging.WARNING):
+            merge_lora_weights(base, lora)
+        assert "without matching lora_B" in caplog.text
+
+    def test_non_lora_keys_ignored(self):
+        """Non-LoRA keys in lora_state_dict are silently ignored."""
+        base = {"layer.weight": torch.zeros(4, 4)}
+        lora = {"some_other_key": torch.ones(4, 4)}
+        result = merge_lora_weights(base, lora)
+        torch.testing.assert_close(result["layer.weight"], torch.zeros(4, 4))
+
+    def test_modifies_base_in_place(self):
+        """Returns the same dict object (modified in-place)."""
+        base = {"layer.weight": torch.zeros(4, 8)}
+        lora = {
+            "layer.lora_A.weight": torch.ones(2, 8),
+            "layer.lora_B.weight": torch.ones(4, 2),
+        }
+        result = merge_lora_weights(base, lora)
+        assert result is base
+
+
+class TestSplitInterleavedQKV:
+    """Tests for split_interleaved_qkv (GPT-NeoX / Persimmon layout)."""
+
+    def test_2d_weight_mha(self):
+        """MHA weight with interleaved [h0_q, h0_k, h0_v, h1_q, ...] layout."""
+        num_heads, head_dim, hidden = 4, 8, 32
+        # Build a known interleaved pattern so we can verify the split
+        qs, ks, vs = [], [], []
+        for h in range(num_heads):
+            qs.append(torch.full((head_dim, hidden), float(h)))
+            ks.append(torch.full((head_dim, hidden), float(h) + 0.1))
+            vs.append(torch.full((head_dim, hidden), float(h) + 0.2))
+        # Interleave: [q0, k0, v0, q1, k1, v1, ...]
+        parts = []
+        for h in range(num_heads):
+            parts.extend([qs[h], ks[h], vs[h]])
+        fused = torch.cat(parts, dim=0)  # [3*hidden, hidden]
+
+        q, k, v = split_interleaved_qkv(fused, num_heads, num_heads, head_dim)
+
+        assert q.shape == (num_heads * head_dim, hidden)
+        assert k.shape == (num_heads * head_dim, hidden)
+        assert v.shape == (num_heads * head_dim, hidden)
+        torch.testing.assert_close(q, torch.cat(qs))
+        torch.testing.assert_close(k, torch.cat(ks))
+        torch.testing.assert_close(v, torch.cat(vs))
+
+    def test_1d_bias(self):
+        """Bias vector (1D) with interleaved layout."""
+        num_heads, head_dim = 4, 8
+        bias = torch.arange(num_heads * 3 * head_dim, dtype=torch.float32)
+        q, k, v = split_interleaved_qkv(bias, num_heads, num_heads, head_dim)
+
+        assert q.shape == (num_heads * head_dim,)
+        assert k.shape == (num_heads * head_dim,)
+        assert v.shape == (num_heads * head_dim,)
+        # Reconstruct from known interleaved pattern
+        reshaped = bias.reshape(num_heads, 3, head_dim)
+        torch.testing.assert_close(q, reshaped[:, 0].reshape(-1))
+        torch.testing.assert_close(k, reshaped[:, 1].reshape(-1))
+        torch.testing.assert_close(v, reshaped[:, 2].reshape(-1))
+
+    def test_wrong_dim_raises(self):
+        """Wrong leading dimension raises ValueError."""
+        with pytest.raises(ValueError, match="expected 96"):
+            split_interleaved_qkv(
+                torch.zeros(100, 32), num_heads=4, num_kv_heads=4, head_dim=8
+            )
+
+    def test_gqa_raises(self):
+        """GQA (num_kv_heads != num_heads) is not supported."""
+        with pytest.raises(ValueError, match="requires MHA"):
+            split_interleaved_qkv(torch.zeros(96, 32), num_heads=4, num_kv_heads=2, head_dim=8)
+
+
+class TestSplitCodegenQKV:
+    """Tests for split_codegen_qkv (QVK model-parallel layout)."""
+
+    def test_basic_split(self):
+        """Verify Q/V/K extraction from mp-interleaved layout."""
+        num_heads, head_dim, hidden, mp_num = 4, 8, 32, 2
+        local_dim = num_heads * head_dim // mp_num  # 16
+
+        # Build known pattern: each mp-block has [q, v, k] chunks
+        q_full = torch.ones(num_heads * head_dim, hidden) * 1.0
+        v_full = torch.ones(num_heads * head_dim, hidden) * 2.0
+        k_full = torch.ones(num_heads * head_dim, hidden) * 3.0
+
+        # Interleave by mp blocks: [q_mp0, v_mp0, k_mp0, q_mp1, v_mp1, k_mp1]
+        parts = []
+        for mp in range(mp_num):
+            s = mp * local_dim
+            e = s + local_dim
+            parts.extend([q_full[s:e], v_full[s:e], k_full[s:e]])
+        fused = torch.cat(parts, dim=0)  # [3*hidden, hidden]
+
+        q, k, v = split_codegen_qkv(fused, num_heads, head_dim, mp_num)
+
+        assert q.shape == (num_heads * head_dim, hidden)
+        assert k.shape == (num_heads * head_dim, hidden)
+        assert v.shape == (num_heads * head_dim, hidden)
+        torch.testing.assert_close(q, q_full)
+        torch.testing.assert_close(k, k_full)
+        torch.testing.assert_close(v, v_full)
+
+    def test_wrong_dim_raises(self):
+        """Wrong leading dimension raises ValueError."""
+        with pytest.raises(ValueError, match="expected 96"):
+            split_codegen_qkv(torch.zeros(100, 32), num_heads=4, head_dim=8)
+
+    def test_indivisible_mp_num_raises(self):
+        """mp_num that doesn't divide hidden raises ValueError."""
+        with pytest.raises(ValueError, match="divisible"):
+            split_codegen_qkv(torch.zeros(96, 32), num_heads=4, head_dim=8, mp_num=3)
+
+
+class TestStackPerExpertMoEWeights:
+    """Per-expert GPTQ/AWQ MoE tensors -> fused expert-major QMoE layout.
+
+    Runs on the MatMulNBits-reshaped layout produced by preprocess_gptq_weights:
+    ``.weight`` [N, n_blocks, blob], ``.scales`` [N, n_blocks].
+    """
+
+    NUM_EXPERTS = 4
+    HIDDEN = 8
+    INTER = 6
+    N_BLOCKS = 2
+    BLOB = 2  # bits=4 -> block_size/2
+
+    def _per_expert_state_dict(self):
+        prefix = "model.layers.0.mlp.experts"
+        sd = {}
+        # Deterministic distinct values so a permutation/gate-up swap is visible.
+        for e in range(self.NUM_EXPERTS):
+            for proj, out in (
+                ("gate_proj", self.INTER),
+                ("up_proj", self.INTER),
+                ("down_proj", self.HIDDEN),
+            ):
+                base = (e + 1) * 1000 + {"gate_proj": 0, "up_proj": 100, "down_proj": 200}[
+                    proj
+                ]
+                w = (
+                    (base + torch.arange(out * self.N_BLOCKS * self.BLOB))
+                    .reshape(out, self.N_BLOCKS, self.BLOB)
+                    .to(torch.uint8)
+                )
+                s = (
+                    (base + torch.arange(out * self.N_BLOCKS))
+                    .reshape(out, self.N_BLOCKS)
+                    .float()
+                )
+                sd[f"{prefix}.{e}.{proj}.weight"] = w
+                sd[f"{prefix}.{e}.{proj}.scales"] = s
+                sd[f"{prefix}.{e}.{proj}.bias"] = torch.zeros(out)
+        return sd, prefix
+
+    def test_stacks_into_fused_expert_major(self):
+        sd, prefix = self._per_expert_state_dict()
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+
+        gu_w = result[f"{prefix}.gate_up_proj.weight"]
+        gu_s = result[f"{prefix}.gate_up_proj.scales"]
+        dn_w = result[f"{prefix}.down_proj.weight"]
+
+        assert gu_w.shape == (self.NUM_EXPERTS, 2 * self.INTER, self.N_BLOCKS, self.BLOB)
+        assert gu_s.shape == (self.NUM_EXPERTS, 2 * self.INTER, self.N_BLOCKS)
+        assert dn_w.shape == (self.NUM_EXPERTS, self.HIDDEN, self.N_BLOCKS, self.BLOB)
+
+        # Per-expert biases/g_idx are dropped; no per-expert keys survive.
+        assert not any(".experts.0." in k for k in result)
+
+    def test_gate_first_then_up_ordering(self):
+        """fc1 rows must be [gate(0:inter); up(inter:2*inter)] per expert."""
+        sd, prefix = self._per_expert_state_dict()
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+        gu_w = result[f"{prefix}.gate_up_proj.weight"]
+        for e in range(self.NUM_EXPERTS):
+            torch.testing.assert_close(
+                gu_w[e, : self.INTER], sd[f"{prefix}.{e}.gate_proj.weight"]
+            )
+            torch.testing.assert_close(
+                gu_w[e, self.INTER :], sd[f"{prefix}.{e}.up_proj.weight"]
+            )
+
+    def test_expert_axis_order_preserved(self):
+        """Stacking must preserve expert index order (catches permutation)."""
+        sd, prefix = self._per_expert_state_dict()
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+        dn_w = result[f"{prefix}.down_proj.weight"]
+        for e in range(self.NUM_EXPERTS):
+            torch.testing.assert_close(dn_w[e], sd[f"{prefix}.{e}.down_proj.weight"])
+
+    def test_already_fused_is_noop(self):
+        """Olive-style fused expert-major tensors pass through unchanged."""
+        sd = {
+            "model.layers.0.mlp.experts.gate_up_proj.weight": torch.zeros(
+                self.NUM_EXPERTS, 2 * self.INTER, self.N_BLOCKS, self.BLOB
+            ),
+            "model.layers.0.mlp.experts.down_proj.weight": torch.zeros(
+                self.NUM_EXPERTS, self.HIDDEN, self.N_BLOCKS, self.BLOB
+            ),
+        }
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+        assert result is sd
+
+    def test_non_expert_keys_pass_through(self):
+        sd, _prefix = self._per_expert_state_dict()
+        sd["model.embed_tokens.weight"] = torch.randn(4, 8)
+        result = stack_per_expert_moe_weights(sd, qmoe_target_path=".mlp")
+        assert torch.equal(
+            result["model.embed_tokens.weight"], sd["model.embed_tokens.weight"]
+        )
+
+
+class TestIsPackedQuantKey:
+    """Shared predicate for packed-quantization sidecar keys."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            # Olive underscore convention (suffix on the parameter name).
+            "model.layers.0.mlp.experts.gate_up_proj_qweight",
+            "model.layers.0.mlp.experts.gate_up_proj_scales",
+            "model.layers.0.mlp.experts.down_proj_qzeros",
+            "model.layers.0.self_attn.q_proj.weight_qweight",
+            # GPTQ/AWQ dotted convention (sibling buffers of the module).
+            "model.layers.0.mlp.experts.0.gate_proj.qweight",
+            "model.layers.0.mlp.experts.0.gate_proj.scales",
+            "model.layers.0.mlp.experts.0.gate_proj.qzeros",
+        ],
+    )
+    def test_packed_keys_detected(self, key):
+        assert is_packed_quant_key(key)
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            # Float weights, including the fused MoE tensors that *are* split.
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.0.mlp.experts.down_proj",
+            "model.layers.0.mlp.gate.weight",
+            "model.layers.0.self_attn.q_proj.bias",
+            "model.layers.0.block_sparse_moe.input_linear.weight",
+            # Already-unpacked names produced downstream by the preprocessors.
+            "model.layers.0.mlp.fc1_experts_weights",
+            "model.layers.0.self_attn.q_proj.zero_points",
+            # Suffix must be terminal, not merely present.
+            "model.layers.0.mlp.experts.gate_up_proj_qweight.extra",
+        ],
+    )
+    def test_unpacked_keys_rejected(self, key):
+        assert not is_packed_quant_key(key)

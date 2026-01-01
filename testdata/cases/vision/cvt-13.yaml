@@ -1,0 +1,14 @@
+model_id: "microsoft/cvt-13"
+model_type: "cvt"
+revision: "main"
+task_type: "image-classification"
+dtype: "float32"
+
+inputs:
+  images:
+    - "pipeline-cat-chonk.jpeg"
+
+skip_reason: "Invalid ArchitectureConfig for CvT model."
+level: "L4"
+
+notes: "CvT-13. Convolutional vision transformer."
