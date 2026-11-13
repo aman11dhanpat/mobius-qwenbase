@@ -88,8 +88,31 @@ class VibeVoiceASRProcessor:
         return VibeVoiceASRBatch(input_values=input_values, padding_mask=padding_mask)
 
     def iter_chunks(self, batch: VibeVoiceASRBatch) -> Iterator[VibeVoiceASRBatch]:
-        """Yield raw 60-second windows; encoder cache bridges adjacent windows."""
-        raise NotImplementedError
+        """Yield raw 60-second windows; encoder cache bridges adjacent windows.
+
+        Each window is ``(batch, 1, chunk_samples)`` except possibly the last,
+        which carries only the remaining samples of the longest waveform.
+        Shorter waveforms keep their right padding, so a window may be
+        entirely padding for them; convolution finalization is driven by
+        ``is_final_chunk`` at each utterance's actual terminal window.
+        """
+        if (
+            batch.input_values.ndim != 2
+            or batch.padding_mask.shape != batch.input_values.shape
+        ):
+            raise ValueError(
+                "iter_chunks expects equal-shaped (batch, samples) inputs and masks"
+            )
+        if batch.input_values.shape[1] == 0:
+            raise ValueError("batch contains no audio samples")
+        total = batch.input_values.shape[1]
+        for start in range(0, total, self.chunk_samples):
+            window = batch.input_values[:, start : start + self.chunk_samples]
+            mask = batch.padding_mask[:, start : start + self.chunk_samples]
+            yield VibeVoiceASRBatch(
+                input_values=window[:, None, :].copy(),
+                padding_mask=mask.copy(),
+            )
 
     @staticmethod
     def make_prompt(

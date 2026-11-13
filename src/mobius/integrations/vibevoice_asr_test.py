@@ -177,6 +177,69 @@ def test_host_finalizes_each_variable_length_utterance_at_its_own_endpoint():
     assert lengths.tolist() == [2, 2]
 
 
+def test_iter_chunks_yields_partial_final_window_when_length_does_not_divide():
+    processor = VibeVoiceASRProcessor()
+    chunk = 5
+    processor.chunk_samples = chunk
+    batch = VibeVoiceASRBatch(
+        input_values=np.arange(12, dtype=np.float32).reshape(1, 12),
+        padding_mask=np.ones((1, 12), dtype=np.bool_),
+    )
+    chunks = list(processor.iter_chunks(batch))
+    assert [chunk_.input_values.shape for chunk_ in chunks] == [
+        (1, 1, chunk),
+        (1, 1, chunk),
+        (1, 1, 2),
+    ]
+    assert [chunk_.padding_mask.shape for chunk_ in chunks] == [
+        (1, chunk),
+        (1, chunk),
+        (1, 2),
+    ]
+    reassembled = np.concatenate([chunk_.input_values[:, 0, :] for chunk_ in chunks], axis=-1)
+    assert (reassembled == batch.input_values[0]).all()
+    assert chunks[-1].padding_mask.all()
+
+
+def test_iter_chunks_keeps_windows_aligned_across_variable_length_batch():
+    processor = VibeVoiceASRProcessor()
+    processor.chunk_samples = 4
+    batch = processor.prepare_audio(
+        [np.arange(1.0, 6.0, dtype=np.float32), np.arange(1.0, 8.0, dtype=np.float32)],
+        sampling_rate=24_000,
+    )
+    chunks = list(processor.iter_chunks(batch))
+    assert [chunk_.input_values.shape for chunk_ in chunks] == [
+        (2, 1, 4),
+        (2, 1, 3),
+    ]
+    assert [chunk_.padding_mask.shape for chunk_ in chunks] == [(2, 4), (2, 3)]
+    # Window 0: item 0 has 5 valid samples (4 + 1 padding tail), item 1 all valid.
+    assert chunks[0].padding_mask[0].tolist() == [True, True, True, True]
+    assert chunks[0].padding_mask[1].tolist() == [True, True, True, True]
+    # Window 1: item 0 has 1 valid sample then padding; item 1 all valid.
+    assert chunks[1].padding_mask[0].tolist() == [True, False, False]
+    assert chunks[1].padding_mask[1].tolist() == [True, True, True]
+    # Per-item samples are preserved end-to-end, padding intact.
+    for index, valid in [(0, 5), (1, 7)]:
+        reassembled = np.concatenate(
+            [chunk_.input_values[index, 0, :] for chunk_ in chunks], axis=-1
+        )
+        assert (reassembled == batch.input_values[index]).all()
+        assert batch.padding_mask[index, :valid].all()
+        assert not batch.padding_mask[index, valid:].any()
+
+
+def test_iter_chunks_rejects_batch_without_audio():
+    processor = VibeVoiceASRProcessor()
+    batch = VibeVoiceASRBatch(
+        input_values=np.zeros((1, 0), dtype=np.float32),
+        padding_mask=np.zeros((1, 0), dtype=np.bool_),
+    )
+    with pytest.raises(ValueError, match="no audio"):
+        list(processor.iter_chunks(batch))
+
+
 def test_processor_builds_source_chat_template_token_layout():
     class Tokenizer:
         def __init__(self):
